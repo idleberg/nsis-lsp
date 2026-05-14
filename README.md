@@ -1,6 +1,6 @@
 # nsis-lsp
 
-![Crates.io License](https://img.shields.io/crates/l/ardent?style=for-the-badge)
+![Crates.io License](https://img.shields.io/crates/l/nsis-lsp?style=for-the-badge)
 [![Crates.io Version](https://img.shields.io/crates/v/nsis-lsp?style=for-the-badge)](https://crates.io/crates/nsis-lsp)
 [![CI](https://img.shields.io/github/actions/workflow/status/idleberg/nsis-lsp/ci.yml?style=for-the-badge)](https://github.com/idleberg/nsis-lsp/actions)
 
