@@ -1,0 +1,23 @@
+[tools]
+bun = "latest"
+rust = "latest"
+
+[tasks.build]
+description = "Build the Rust formatter"
+run = "cargo build --release"
+
+[tasks.fmt]
+description = "Format Rust code"
+run = "cargo fmt"
+
+[tasks."fmt:check"]
+description = "Check Rust code formatting"
+run = "cargo fmt --check"
+
+[tasks.lint]
+description = "Lint Rust code with Clippy"
+run = "cargo clippy -- --deny warnings"
+
+[tasks.compare]
+description = "Compare Node.js and Rust formatter output on provided input files"
+run = "bun tasks/compare.ts"
