@@ -8,9 +8,10 @@
 
 ## Description
 
-While still in experimental stage, this language server provides the following features:
+While still in an **experimental stage**, this language server already provides some useful features:
 
 - syntax highlighting
+- completions
 - code formatting
 - go-to-definition
 - on-hover information
