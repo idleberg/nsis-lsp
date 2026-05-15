@@ -713,7 +713,10 @@ mod tests {
 
 	#[test]
 	fn percent_decode_spaces() {
-		assert_eq!(percent_decode("/my%20path/file%20name"), "/my path/file name");
+		assert_eq!(
+			percent_decode("/my%20path/file%20name"),
+			"/my path/file name"
+		);
 	}
 
 	#[test]
@@ -832,10 +835,7 @@ mod tests {
 	#[test]
 	fn word_at_position_simple() {
 		let text = "Section main\n  DetailPrint hello\nSectionEnd";
-		assert_eq!(
-			word_at_position(text, 1, 4),
-			Some("DetailPrint".into())
-		);
+		assert_eq!(word_at_position(text, 1, 4), Some("DetailPrint".into()));
 	}
 
 	#[test]

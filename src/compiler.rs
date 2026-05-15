@@ -85,7 +85,10 @@ mod tests {
 
 	#[test]
 	fn from_option_ppo() {
-		assert_eq!(PreprocessMode::from_option(Some("ppo")), PreprocessMode::Ppo);
+		assert_eq!(
+			PreprocessMode::from_option(Some("ppo")),
+			PreprocessMode::Ppo
+		);
 	}
 
 	#[test]
