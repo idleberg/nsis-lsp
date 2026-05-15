@@ -261,3 +261,62 @@ pub const CONSTANTS: &[(&str, &str)] = &[
 	("IDD_UNINST", "Uninstall page dialog ID"),
 	("IDD_VERIFY", "Verify page dialog ID"),
 ];
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn docs_parses_entries() {
+		assert!(!DOCS.is_empty(), "DOCS should contain parsed entries");
+	}
+
+	#[test]
+	fn lookup_doc_exact_command() {
+		let entry = lookup_doc("Name");
+		assert!(entry.is_some(), "should find 'Name' command");
+	}
+
+	#[test]
+	fn lookup_doc_case_insensitive() {
+		let entry = lookup_doc("name");
+		assert!(entry.is_some(), "lookup should be case-insensitive");
+	}
+
+	#[test]
+	fn lookup_doc_bang_prefix_fallback() {
+		let entry = lookup_doc("include");
+		assert!(
+			entry.is_some(),
+			"should find '!include' when given 'include'"
+		);
+		assert!(entry.unwrap().name.starts_with('!'));
+	}
+
+	#[test]
+	fn lookup_doc_nonexistent() {
+		assert!(lookup_doc("__nonexistent_command__").is_none());
+	}
+
+	#[test]
+	fn builtin_variables_not_empty() {
+		assert!(!BUILTIN_VARIABLES.is_empty());
+	}
+
+	#[test]
+	fn builtin_variables_start_with_dollar() {
+		for (var, _) in BUILTIN_VARIABLES {
+			assert!(var.starts_with('$'), "{var} should start with $");
+		}
+	}
+
+	#[test]
+	fn constants_not_empty() {
+		assert!(!CONSTANTS.is_empty());
+	}
+
+	#[test]
+	fn deprecated_commands_not_empty() {
+		assert!(!DEPRECATED_COMMANDS.is_empty());
+	}
+}

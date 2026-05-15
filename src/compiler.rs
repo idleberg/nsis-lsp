@@ -78,3 +78,55 @@ fn which(binary: &str) -> Option<String> {
 	}
 	None
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn from_option_ppo() {
+		assert_eq!(PreprocessMode::from_option(Some("ppo")), PreprocessMode::Ppo);
+	}
+
+	#[test]
+	fn from_option_safe_ppo() {
+		assert_eq!(
+			PreprocessMode::from_option(Some("safe_ppo")),
+			PreprocessMode::SafePpo
+		);
+	}
+
+	#[test]
+	fn from_option_none_variant() {
+		assert_eq!(PreprocessMode::from_option(None), PreprocessMode::None);
+	}
+
+	#[test]
+	fn from_option_unknown_string() {
+		assert_eq!(
+			PreprocessMode::from_option(Some("bogus")),
+			PreprocessMode::None
+		);
+	}
+
+	#[test]
+	fn find_makensis_empty_custom_path() {
+		let result = find_makensis("");
+		// Falls through to which(); result depends on environment
+		// but must not panic
+		let _ = result;
+	}
+
+	#[test]
+	fn find_makensis_nonexistent_custom_path_falls_through_to_which() {
+		let result = find_makensis("/no/such/binary/makensis");
+		// Custom path doesn't exist, so it falls through to which("makensis").
+		// Result depends on whether makensis is installed on the system.
+		assert!(result.is_none() || result.as_deref().is_some_and(|p| p.contains("makensis")));
+	}
+
+	#[test]
+	fn which_nonexistent_binary() {
+		assert_eq!(which("__no_such_binary_xyz__"), None);
+	}
+}

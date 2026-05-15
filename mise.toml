@@ -9,7 +9,7 @@ run = "cargo build --release"
 
 [tasks.checks]
 description = "Run all checks (formatting, linting)"
-depends = ["format:check", "lint"]
+depends = ["format:check", "lint", "test"]
 
 [tasks.format]
 description = "Format Rust code"
@@ -22,6 +22,10 @@ run = "cargo fmt --check"
 [tasks.lint]
 description = "Lint Rust code with Clippy"
 run = "cargo clippy -- --deny warnings"
+
+[tasks.test]
+description = "Run all tests"
+run = "cargo test"
 
 [tasks.compare]
 description = "Compare Node.js and Rust formatter output on provided input files"

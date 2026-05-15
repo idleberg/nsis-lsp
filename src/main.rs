@@ -699,3 +699,261 @@ fn cast_notification<N: lsp_types::notification::Notification>(
 ) -> Option<N::Params> {
 	not.extract::<N::Params>(N::METHOD).ok()
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	// ── percent_decode / uri_to_file_path ──
+
+	#[test]
+	fn percent_decode_no_encoding() {
+		assert_eq!(percent_decode("/foo/bar.nsi"), "/foo/bar.nsi");
+	}
+
+	#[test]
+	fn percent_decode_spaces() {
+		assert_eq!(percent_decode("/my%20path/file%20name"), "/my path/file name");
+	}
+
+	#[test]
+	fn percent_decode_mixed() {
+		assert_eq!(percent_decode("a%2Fb%25c"), "a/b%c");
+	}
+
+	#[test]
+	fn uri_to_file_path_valid() {
+		assert_eq!(
+			uri_to_file_path("file:///home/user/test.nsi"),
+			Some("/home/user/test.nsi".into())
+		);
+	}
+
+	#[test]
+	fn uri_to_file_path_not_file_uri() {
+		assert_eq!(uri_to_file_path("https://example.com"), None);
+	}
+
+	// ── parse_error_position ──
+
+	#[test]
+	fn parse_error_position_valid() {
+		assert_eq!(
+			parse_error_position("something failed at 10:5 blah"),
+			Some((9, 4))
+		);
+	}
+
+	#[test]
+	fn parse_error_position_no_at() {
+		assert_eq!(parse_error_position("no position here"), None);
+	}
+
+	// ── truncate ──
+
+	#[test]
+	fn truncate_short_string() {
+		assert_eq!(truncate("hello", 10), "hello");
+	}
+
+	#[test]
+	fn truncate_long_string() {
+		let result = truncate("hello world", 5);
+		assert_eq!(result, "hello…");
+	}
+
+	// ── trigger_prefix_texts ──
+
+	#[test]
+	fn trigger_prefix_bang() {
+		let (f, i) = trigger_prefix_texts("!include");
+		assert_eq!(f, Some("include".into()));
+		assert_eq!(i, Some("include".into()));
+	}
+
+	#[test]
+	fn trigger_prefix_dollar() {
+		let (f, i) = trigger_prefix_texts("$INSTDIR");
+		assert_eq!(f, Some("INSTDIR".into()));
+		assert_eq!(i, Some("INSTDIR".into()));
+	}
+
+	#[test]
+	fn trigger_prefix_none() {
+		let (f, i) = trigger_prefix_texts("Section");
+		assert_eq!(f, None);
+		assert_eq!(i, None);
+	}
+
+	// ── is_ident_char ──
+
+	#[test]
+	fn ident_char_alphanumeric() {
+		assert!(is_ident_char(b'a'));
+		assert!(is_ident_char(b'Z'));
+		assert!(is_ident_char(b'5'));
+	}
+
+	#[test]
+	fn ident_char_underscore_dot() {
+		assert!(is_ident_char(b'_'));
+		assert!(is_ident_char(b'.'));
+	}
+
+	#[test]
+	fn ident_char_rejects_special() {
+		assert!(!is_ident_char(b' '));
+		assert!(!is_ident_char(b'!'));
+		assert!(!is_ident_char(b'$'));
+	}
+
+	// ── utf16 <-> byte offset ──
+
+	#[test]
+	fn utf16_to_byte_ascii() {
+		assert_eq!(utf16_to_byte_offset("hello", 3), 3);
+	}
+
+	#[test]
+	fn byte_to_utf16_ascii() {
+		assert_eq!(byte_to_utf16_offset("hello", 3), 3);
+	}
+
+	#[test]
+	fn utf16_roundtrip_multibyte() {
+		let line = "aé€b";
+		let byte_off = utf16_to_byte_offset(line, 3);
+		let utf16_off = byte_to_utf16_offset(line, byte_off);
+		assert_eq!(utf16_off, 3);
+	}
+
+	// ── word_at_position ──
+
+	#[test]
+	fn word_at_position_simple() {
+		let text = "Section main\n  DetailPrint hello\nSectionEnd";
+		assert_eq!(
+			word_at_position(text, 1, 4),
+			Some("DetailPrint".into())
+		);
+	}
+
+	#[test]
+	fn word_at_position_bang_prefix() {
+		let text = "!include file.nsh";
+		assert_eq!(word_at_position(text, 0, 2), Some("!include".into()));
+	}
+
+	#[test]
+	fn word_at_position_dollar_prefix() {
+		let text = "StrCpy $0 $INSTDIR";
+		assert_eq!(word_at_position(text, 0, 12), Some("$INSTDIR".into()));
+	}
+
+	#[test]
+	fn word_at_position_out_of_range() {
+		assert_eq!(word_at_position("hello", 5, 0), None);
+	}
+
+	// ── is_in_comment ──
+
+	#[test]
+	fn line_comment_hash() {
+		let text = "# this is a comment";
+		assert!(is_in_comment(text, 0, 5));
+	}
+
+	#[test]
+	fn line_comment_semicolon() {
+		let text = "; this is a comment";
+		assert!(is_in_comment(text, 0, 5));
+	}
+
+	#[test]
+	fn not_in_comment() {
+		let text = "Section main";
+		assert!(!is_in_comment(text, 0, 3));
+	}
+
+	#[test]
+	fn block_comment() {
+		let text = "/* comment\nstill comment */\ncode";
+		assert!(is_in_comment(text, 1, 2));
+		assert!(!is_in_comment(text, 2, 0));
+	}
+
+	#[test]
+	fn word_at_position_in_comment_returns_none() {
+		let text = "# DetailPrint hello";
+		assert_eq!(word_at_position(text, 0, 5), None);
+	}
+
+	// ── compute_diagnostics ──
+
+	#[test]
+	fn compute_diagnostics_deprecated_command() {
+		let text = "SubSection test";
+		let diags = compute_diagnostics(text);
+		assert_eq!(diags.len(), 1);
+		assert!(diags[0].message.contains("deprecated"));
+	}
+
+	#[test]
+	fn compute_diagnostics_no_deprecated() {
+		let text = "Section main\nSectionEnd";
+		let diags = compute_diagnostics(text);
+		assert!(diags.is_empty());
+	}
+
+	#[test]
+	fn compute_diagnostics_case_insensitive() {
+		let text = "subsection test";
+		let diags = compute_diagnostics(text);
+		assert_eq!(diags.len(), 1);
+	}
+
+	// ── hover_for_word ──
+
+	#[test]
+	fn hover_builtin_variable() {
+		let hover = hover_for_word("$INSTDIR");
+		assert!(hover.is_some());
+		assert!(hover.unwrap().contains("installation directory"));
+	}
+
+	#[test]
+	fn hover_builtin_variable_without_dollar() {
+		let hover = hover_for_word("INSTDIR");
+		assert!(hover.is_some());
+	}
+
+	#[test]
+	fn hover_constant() {
+		let hover = hover_for_word("MB_OK");
+		assert!(hover.is_some());
+		assert!(hover.unwrap().contains("OK button"));
+	}
+
+	#[test]
+	fn hover_deprecated() {
+		let hover = hover_for_word("SubSection");
+		assert!(hover.is_some());
+		assert!(hover.unwrap().contains("deprecated"));
+	}
+
+	#[test]
+	fn hover_unknown() {
+		assert!(hover_for_word("__nonexistent__").is_none());
+	}
+
+	// ── line_range ──
+
+	#[test]
+	fn line_range_with_leading_whitespace() {
+		let line = "  Section main";
+		let range = line_range(3, line);
+		assert_eq!(range.start.line, 3);
+		assert_eq!(range.start.character, 2);
+		assert_eq!(range.end.character, 14);
+	}
+}
