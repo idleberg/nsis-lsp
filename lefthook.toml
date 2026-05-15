@@ -1,6 +1,6 @@
 [pre-commit.commands.format]
 glob = "*.rs"
-run = "mise run fmt:check"
+run = "mise run format:check"
 stage_fixed = true
 
 [pre-commit.commands.lint]
