@@ -1,3 +1,5 @@
+mod compiler;
+mod diagnostics;
 mod nsis_data;
 
 use std::collections::HashMap;
@@ -13,11 +15,59 @@ use lsp_types::{
 	ServerCapabilities, ShowMessageParams, TextDocumentSyncCapability, TextDocumentSyncKind,
 	TextEdit,
 	notification::{
-		DidChangeTextDocument, DidOpenTextDocument, Notification as _, PublishDiagnostics,
-		ShowMessage,
+		DidChangeTextDocument, DidOpenTextDocument, DidSaveTextDocument, Notification as _,
+		PublishDiagnostics, ShowMessage,
 	},
 	request::{Completion, Formatting, GotoDefinition, HoverRequest, Request as _},
 };
+use serde::Deserialize;
+
+use compiler::PreprocessMode;
+
+#[derive(Debug, Default, Deserialize)]
+struct InitOptions {
+	#[serde(default)]
+	diagnostics: DiagnosticsOptions,
+	#[serde(default)]
+	makensis: MakensisOptions,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiagnosticsOptions {
+	#[serde(default = "default_preprocess_mode")]
+	preprocess_mode: Option<String>,
+	#[serde(default = "default_true")]
+	enabled_on_save: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MakensisOptions {
+	#[serde(default)]
+	path: String,
+}
+
+fn default_preprocess_mode() -> Option<String> {
+	Some("ppo".into())
+}
+
+fn default_true() -> bool {
+	true
+}
+
+impl Default for DiagnosticsOptions {
+	fn default() -> Self {
+		Self {
+			preprocess_mode: default_preprocess_mode(),
+			enabled_on_save: true,
+		}
+	}
+}
+
+struct LspState {
+	makensis_path: Option<String>,
+	preprocess_mode: PreprocessMode,
+	diagnostics_on_save: bool,
+}
 
 fn main() {
 	let (connection, io_threads) = Connection::stdio();
@@ -30,16 +80,40 @@ fn main() {
 			..Default::default()
 		}),
 		definition_provider: Some(OneOf::Left(true)),
-		text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
+		text_document_sync: Some(TextDocumentSyncCapability::Options(
+			lsp_types::TextDocumentSyncOptions {
+				open_close: Some(true),
+				change: Some(TextDocumentSyncKind::FULL),
+				save: Some(lsp_types::TextDocumentSyncSaveOptions::Supported(true)),
+				..Default::default()
+			},
+		)),
 		..Default::default()
 	};
 
-	if let Err(e) = connection.initialize(serde_json::to_value(&capabilities).unwrap()) {
-		if e.channel_is_disconnected() {
-			io_threads.join().ok();
+	let init_result = connection.initialize(serde_json::to_value(&capabilities).unwrap());
+	let init_params = match init_result {
+		Ok(params) => params,
+		Err(e) => {
+			if e.channel_is_disconnected() {
+				io_threads.join().ok();
+			}
+			return;
 		}
-		return;
-	}
+	};
+
+	let options: InitOptions = init_params
+		.get("initializationOptions")
+		.and_then(|v| serde_json::from_value(v.clone()).ok())
+		.unwrap_or_default();
+
+	let state = LspState {
+		makensis_path: compiler::find_makensis(&options.makensis.path),
+		preprocess_mode: PreprocessMode::from_option(
+			options.diagnostics.preprocess_mode.as_deref(),
+		),
+		diagnostics_on_save: options.diagnostics.enabled_on_save,
+	};
 
 	let mut documents: HashMap<String, String> = HashMap::new();
 
@@ -52,7 +126,7 @@ fn main() {
 				handle_request(&connection, req, &documents);
 			}
 			Message::Notification(not) => {
-				handle_notification(&connection, not, &mut documents);
+				handle_notification(&connection, not, &mut documents, &state);
 			}
 			Message::Response(_) => {}
 		}
@@ -98,18 +172,55 @@ fn handle_notification(
 	connection: &Connection,
 	not: Notification,
 	documents: &mut HashMap<String, String>,
+	state: &LspState,
 ) {
 	if let Some(params) = cast_notification::<DidOpenTextDocument>(not.clone()) {
 		let uri = params.text_document.uri;
 		documents.insert(uri.to_string(), params.text_document.text.clone());
 		publish_diagnostics(connection, uri, &params.text_document.text);
-	} else if let Some(params) = cast_notification::<DidChangeTextDocument>(not)
+	} else if let Some(params) = cast_notification::<DidChangeTextDocument>(not.clone())
 		&& let Some(change) = params.content_changes.into_iter().last()
 	{
 		let uri = params.text_document.uri;
 		documents.insert(uri.to_string(), change.text.clone());
 		publish_diagnostics(connection, uri, &change.text);
+	} else if let Some(params) = cast_notification::<DidSaveTextDocument>(not)
+		&& state.diagnostics_on_save
+	{
+		let uri = params.text_document.uri;
+		if let Some(text) = documents.get(&uri.to_string()) {
+			run_compiler_diagnostics(connection, state, &uri, text);
+		}
 	}
+}
+
+fn run_compiler_diagnostics(
+	connection: &Connection,
+	state: &LspState,
+	uri: &lsp_types::Uri,
+	text: &str,
+) {
+	let Some(makensis_path) = &state.makensis_path else {
+		return;
+	};
+
+	let Some(file_path) = uri_to_file_path(&uri.to_string()) else {
+		return;
+	};
+
+	let mut all_diagnostics = compute_diagnostics(text);
+
+	let Ok(output) = compiler::run_makensis(makensis_path, &file_path, &state.preprocess_mode)
+	else {
+		return;
+	};
+
+	all_diagnostics.extend(diagnostics::parse_warnings(&output.stdout));
+	if let Some(diag) = diagnostics::parse_error(&output.stderr) {
+		all_diagnostics.push(diag);
+	}
+
+	send_diagnostics(connection, uri.clone(), all_diagnostics);
 }
 
 // ── Formatting ──
@@ -556,6 +667,31 @@ fn byte_to_utf16_offset(line: &str, byte_offset: usize) -> u32 {
 fn send_response(connection: &Connection, id: RequestId, result: impl serde::Serialize) {
 	let resp = Response::new_ok(id, result);
 	connection.sender.send(Message::Response(resp)).ok();
+}
+
+fn uri_to_file_path(uri_str: &str) -> Option<String> {
+	let stripped = uri_str.strip_prefix("file://")?;
+	Some(percent_decode(stripped))
+}
+
+fn percent_decode(s: &str) -> String {
+	let mut result = Vec::new();
+	let bytes = s.as_bytes();
+	let mut i = 0;
+	while i < bytes.len() {
+		if bytes[i] == b'%'
+			&& i + 2 < bytes.len()
+			&& let Ok(byte) =
+				u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+		{
+			result.push(byte);
+			i += 3;
+			continue;
+		}
+		result.push(bytes[i]);
+		i += 1;
+	}
+	String::from_utf8_lossy(&result).into_owned()
 }
 
 fn cast_notification<N: lsp_types::notification::Notification>(

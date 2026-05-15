@@ -15,6 +15,7 @@ While still in an **experimental stage**, this language server already provides 
 - code formatting
 - go-to-definition
 - on-hover information
+- compiler diagnostics
 
 ## Installation
 
@@ -33,6 +34,16 @@ cargo build --release
 ```
 
 The binary is at `target/release/nsis-lsp`.
+
+## Configuration
+
+The language server accepts settings via LSP `initializationOptions`:
+
+| Setting                       | Type             | Default | Description                                                                             |
+| ----------------------------- | ---------------- | ------- | --------------------------------------------------------------------------------------- |
+| `diagnostics.preprocess_mode` | `string \| null` | `"ppo"` | Preprocessor mode for `makensis`: `"ppo"`, `"safe_ppo"`, or `null` for full compilation |
+| `diagnostics.enabled_on_save` | `boolean`        | `true`  | Run compiler diagnostics on save                                                        |
+| `makensis.path`               | `string`         | `""`    | Custom path to the `makensis` binary (uses `PATH` when empty)                           |
 
 ## License
 
