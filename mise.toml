@@ -7,11 +7,15 @@ rust = "latest"
 description = "Build the Rust formatter"
 run = "cargo build --release"
 
-[tasks.fmt]
+[tasks.checks]
+description = "Run all checks (formatting, linting)"
+depends = ["format:check", "lint"]
+
+[tasks.format]
 description = "Format Rust code"
 run = "cargo fmt"
 
-[tasks."fmt:check"]
+[tasks."format:check"]
 description = "Check Rust code formatting"
 run = "cargo fmt --check"
 
