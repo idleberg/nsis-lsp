@@ -36,4 +36,4 @@ The binary is at `target/release/nsis-lsp`.
 
 ## License
 
-This work is licensed under the [Apache License, Version 2.0](LICENSE).
+This work is licensed under the [Apache License, Version 2.0](LICENSE-APACHE) or [The MIT License](LICENSE-MIT).
