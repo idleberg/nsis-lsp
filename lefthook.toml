@@ -1,9 +1,9 @@
 [pre-commit.commands.format]
-glob = "*.{rs}"
-run = "mise run fmt:check {staged_files}"
+glob = "*.rs"
+run = "mise run fmt:check"
 stage_fixed = true
 
 [pre-commit.commands.lint]
 glob = "*.rs"
-run = "mise run lint {staged_files}"
+run = "mise run lint"
 stage_fixed = true
