@@ -1,0 +1,9 @@
+[pre-commit.commands.format]
+glob = "*.{rs}"
+run = "mise run fmt:check {staged_files}"
+stage_fixed = true
+
+[pre-commit.commands.lint]
+glob = "*.rs"
+run = "mise run lint {staged_files}"
+stage_fixed = true

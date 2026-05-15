@@ -1,5 +1,6 @@
 [tools]
 bun = "latest"
+lefthook = "latest"
 rust = "latest"
 
 [tasks.build]
