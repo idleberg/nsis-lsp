@@ -1,6 +1,11 @@
+# build artifacts
 /target
 
+# all things nodejs
 /node_modules
 bun.lock
 package-lock.json
 pnpm-lock.yaml
+
+# claude
+!/.claude/settings.local.json
