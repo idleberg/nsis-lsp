@@ -184,12 +184,15 @@ jobs:
         shell: bash
         run: |
           for pkg in packages/lsp-*/; do
-            npm publish "$pkg" --access public
+            cd "$pkg"
+            npm publish --access public
+            cd "$GITHUB_WORKSPACE"
           done
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish main package
-        run: npm publish packages/lsp --access public
+        working-directory: packages/lsp
+        run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
