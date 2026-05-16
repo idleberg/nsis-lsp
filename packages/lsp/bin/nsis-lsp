@@ -32,6 +32,7 @@ function getBinaryPath() {
 
 	try {
 		const pkgDir = require.resolve(`${pkg}/package.json`);
+
 		return join(pkgDir, "..", bin);
 	} catch {
 		console.error(
@@ -39,6 +40,7 @@ function getBinaryPath() {
 				`This may be caused by a missing optional dependency when installing with --no-optional.\n` +
 				`You can set the NSIS_LSP_BINARY environment variable to point to the binary directly.`,
 		);
+
 		process.exit(1);
 	}
 }
@@ -53,5 +55,6 @@ try {
 	if (e.status !== null) {
 		process.exit(e.status);
 	}
+
 	throw e;
 }
