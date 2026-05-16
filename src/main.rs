@@ -11,12 +11,12 @@ use lsp_types::{
 	CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
 	Diagnostic, DiagnosticSeverity, DocumentFormattingParams, GotoDefinitionParams,
 	GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability, Location,
-	MarkupContent, MarkupKind, MessageType, OneOf, Position, PublishDiagnosticsParams, Range,
-	ServerCapabilities, ShowMessageParams, TextDocumentSyncCapability, TextDocumentSyncKind,
-	TextEdit,
+	LogMessageParams, MarkupContent, MarkupKind, MessageType, OneOf, Position,
+	PublishDiagnosticsParams, Range, ServerCapabilities, ShowMessageParams,
+	TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit,
 	notification::{
-		DidChangeTextDocument, DidOpenTextDocument, DidSaveTextDocument, Notification as _,
-		PublishDiagnostics, ShowMessage,
+		DidChangeTextDocument, DidOpenTextDocument, DidSaveTextDocument, LogMessage,
+		Notification as _, PublishDiagnostics, ShowMessage,
 	},
 	request::{Completion, Formatting, GotoDefinition, HoverRequest, Request as _},
 };
@@ -114,6 +114,26 @@ fn main() {
 		),
 		diagnostics_on_save: options.diagnostics.enabled_on_save,
 	};
+
+	log_message(
+		&connection,
+		MessageType::INFO,
+		&format!("nsis-lsp v{} initialized", env!("CARGO_PKG_VERSION")),
+	);
+
+	if let Some(ref path) = state.makensis_path {
+		log_message(
+			&connection,
+			MessageType::INFO,
+			&format!("Using makensis: {path}"),
+		);
+	} else {
+		log_message(
+			&connection,
+			MessageType::WARNING,
+			"makensis not found — diagnostics unavailable",
+		);
+	}
 
 	let mut documents: HashMap<String, String> = HashMap::new();
 
@@ -405,6 +425,18 @@ fn send_diagnostics(connection: &Connection, uri: lsp_types::Uri, diagnostics: V
 	};
 	let not = Notification::new(
 		PublishDiagnostics::METHOD.to_string(),
+		serde_json::to_value(params).unwrap(),
+	);
+	connection.sender.send(Message::Notification(not)).ok();
+}
+
+fn log_message(connection: &Connection, typ: MessageType, msg: &str) {
+	let params = LogMessageParams {
+		typ,
+		message: msg.to_string(),
+	};
+	let not = Notification::new(
+		LogMessage::METHOD.to_string(),
 		serde_json::to_value(params).unwrap(),
 	);
 	connection.sender.send(Message::Notification(not)).ok();
