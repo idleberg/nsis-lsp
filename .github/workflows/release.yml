@@ -27,9 +27,21 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact-name: darwin-arm64
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            artifact-name: linux-x64-musl
+            use-cross: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            artifact-name: linux-arm64-musl
+            use-cross: true
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             artifact-name: windows-x64
+          - target: aarch64-pc-windows-msvc
+            os: ubuntu-latest
+            artifact-name: windows-arm64
+            use-cargo-xwin: true
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -48,12 +60,20 @@ jobs:
         if: matrix.use-cross
         run: cargo install cross
 
+      - name: Install cargo-xwin
+        if: matrix.use-cargo-xwin
+        run: cargo install cargo-xwin
+
       - name: Build (cross)
         if: matrix.use-cross
         run: cross build --release --target ${{ matrix.target }}
 
+      - name: Build (cargo-xwin)
+        if: matrix.use-cargo-xwin
+        run: cargo xwin build --release --target ${{ matrix.target }}
+
       - name: Build (native)
-        if: "!matrix.use-cross"
+        if: ${{ !matrix.use-cross && !matrix.use-cargo-xwin }}
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Get version
@@ -77,6 +97,12 @@ jobs:
         with:
           name: nsis-lsp-${{ matrix.artifact-name }}
           path: nsis-lsp-*.zip
+
+      - name: Upload binary for npm
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nsis-lsp-bin-${{ matrix.artifact-name }}
+          path: target/${{ matrix.target }}/release/nsis-lsp${{ contains(matrix.target, 'windows') && '.exe' || '' }}
 
   release:
     needs: build
@@ -104,3 +130,69 @@ jobs:
         run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  publish-npm:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: nsis-lsp-bin-*
+          path: artifacts/
+
+      - name: Copy binaries into platform packages
+        shell: bash
+        run: |
+          declare -A MAP=(
+            [darwin-arm64]=lsp-darwin-arm64
+            [darwin-x64]=lsp-darwin-x64
+            [linux-arm64]=lsp-linux-arm64
+            [linux-x64]=lsp-linux-x64
+            [linux-x64-musl]=lsp-linux-x64-musl
+            [linux-arm64-musl]=lsp-linux-arm64-musl
+            [windows-x64]=lsp-win32-x64
+            [windows-arm64]=lsp-win32-arm64
+          )
+          for key in "${!MAP[@]}"; do
+            pkg="packages/${MAP[$key]}"
+            if [[ "$key" == windows* ]]; then
+              cp "artifacts/nsis-lsp-bin-${key}/nsis-lsp.exe" "$pkg/"
+            else
+              cp "artifacts/nsis-lsp-bin-${key}/nsis-lsp" "$pkg/"
+              chmod +x "$pkg/nsis-lsp"
+            fi
+          done
+
+      - name: Set version from tag
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          for pkg in packages/*/package.json; do
+            sed -i "s/\"version\": \"0\.0\.0\"/\"version\": \"$VERSION\"/" "$pkg"
+            sed -i "s/\": \"0\.0\.0\"/\": \"$VERSION\"/g" "$pkg"
+          done
+
+      - name: Publish platform packages
+        shell: bash
+        run: |
+          for pkg in packages/lsp-*/; do
+            cd "$pkg"
+            npm publish --access public
+            cd "$GITHUB_WORKSPACE"
+          done
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish main package
+        working-directory: packages/lsp
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

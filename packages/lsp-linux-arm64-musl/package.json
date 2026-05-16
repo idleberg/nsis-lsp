@@ -1,0 +1,8 @@
+{
+  "name": "@nsis/lsp-linux-arm64-musl",
+  "version": "0.0.0",
+  "license": "MIT OR Apache-2.0",
+  "os": ["linux"],
+  "cpu": ["arm64"],
+  "libc": ["musl"]
+}
