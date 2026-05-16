@@ -1,0 +1,7 @@
+{
+  "name": "@nsis/lsp-win32-x64",
+  "version": "0.0.0",
+  "license": "MIT OR Apache-2.0",
+  "os": ["win32"],
+  "cpu": ["x64"]
+}
