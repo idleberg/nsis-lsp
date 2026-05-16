@@ -9,6 +9,7 @@ const PLATFORMS = {
   "linux arm64": "@nsis/lsp-linux-arm64",
   "linux x64": "@nsis/lsp-linux-x64",
   "win32 x64": "@nsis/lsp-win32-x64",
+  "win32 arm64": "@nsis/lsp-win32-arm64",
 };
 
 function getBinaryPath() {

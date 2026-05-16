@@ -38,6 +38,10 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             artifact-name: windows-x64
+          - target: aarch64-pc-windows-msvc
+            os: ubuntu-latest
+            artifact-name: windows-arm64
+            use-cargo-xwin: true
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -56,12 +60,20 @@ jobs:
         if: matrix.use-cross
         run: cargo install cross
 
+      - name: Install cargo-xwin
+        if: matrix.use-cargo-xwin
+        run: cargo install cargo-xwin
+
       - name: Build (cross)
         if: matrix.use-cross
         run: cross build --release --target ${{ matrix.target }}
 
+      - name: Build (cargo-xwin)
+        if: matrix.use-cargo-xwin
+        run: cargo xwin build --release --target ${{ matrix.target }}
+
       - name: Build (native)
-        if: "!matrix.use-cross"
+        if: ${{ !matrix.use-cross && !matrix.use-cargo-xwin }}
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Get version
@@ -147,6 +159,7 @@ jobs:
             [linux-x64-musl]=lsp-linux-x64-musl
             [linux-arm64-musl]=lsp-linux-arm64-musl
             [windows-x64]=lsp-win32-x64
+            [windows-arm64]=lsp-win32-arm64
           )
           for key in "${!MAP[@]}"; do
             pkg="packages/${MAP[$key]}"

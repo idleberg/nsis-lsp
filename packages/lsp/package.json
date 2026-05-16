@@ -13,6 +13,7 @@
     "@nsis/lsp-linux-x64": "0.0.0",
     "@nsis/lsp-linux-x64-musl": "0.0.0",
     "@nsis/lsp-linux-arm64-musl": "0.0.0",
-    "@nsis/lsp-win32-x64": "0.0.0"
+    "@nsis/lsp-win32-x64": "0.0.0",
+    "@nsis/lsp-win32-arm64": "0.0.0"
   }
 }
