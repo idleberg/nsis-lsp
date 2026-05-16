@@ -1,7 +1,7 @@
 {
-  "name": "@nsis/lsp-darwin-arm64",
-  "version": "0.0.0",
-  "license": "MIT OR Apache-2.0",
-  "os": ["darwin"],
-  "cpu": ["arm64"]
+	"name": "@nsis/lsp-darwin-arm64",
+	"version": "0.0.0",
+	"license": "MIT OR Apache-2.0",
+	"os": ["darwin"],
+	"cpu": ["arm64"]
 }
