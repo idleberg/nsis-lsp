@@ -1,57 +1,57 @@
 #!/usr/bin/env node
 
-const { execFileSync } = require("child_process");
-const { join } = require("path");
+const { execFileSync } = require("node:child_process");
+const { join } = require("node:path");
 
 const PLATFORMS = {
-  "darwin arm64": "@nsis/lsp-darwin-arm64",
-  "darwin x64": "@nsis/lsp-darwin-x64",
-  "linux arm64": "@nsis/lsp-linux-arm64",
-  "linux x64": "@nsis/lsp-linux-x64",
-  "win32 x64": "@nsis/lsp-win32-x64",
-  "win32 arm64": "@nsis/lsp-win32-arm64",
+	"darwin arm64": "@nsis/lsp-darwin-arm64",
+	"darwin x64": "@nsis/lsp-darwin-x64",
+	"linux arm64": "@nsis/lsp-linux-arm64",
+	"linux x64": "@nsis/lsp-linux-x64",
+	"win32 x64": "@nsis/lsp-win32-x64",
+	"win32 arm64": "@nsis/lsp-win32-arm64",
 };
 
 function getBinaryPath() {
-  if (process.env.NSIS_LSP_BINARY) {
-    return process.env.NSIS_LSP_BINARY;
-  }
+	if (process.env.NSIS_LSP_BINARY) {
+		return process.env.NSIS_LSP_BINARY;
+	}
 
-  const platformKey = `${process.platform} ${process.arch}`;
-  const pkg = PLATFORMS[platformKey];
+	const platformKey = `${process.platform} ${process.arch}`;
+	const pkg = PLATFORMS[platformKey];
 
-  if (!pkg) {
-    console.error(
-      `Unsupported platform: ${process.platform} ${process.arch}\n` +
-        `nsis-lsp currently supports: ${Object.keys(PLATFORMS).join(", ")}`,
-    );
-    process.exit(1);
-  }
+	if (!pkg) {
+		console.error(
+			`Unsupported platform: ${process.platform} ${process.arch}\n` +
+				`nsis-lsp currently supports: ${Object.keys(PLATFORMS).join(", ")}`,
+		);
+		process.exit(1);
+	}
 
-  const bin = process.platform === "win32" ? "nsis-lsp.exe" : "nsis-lsp";
+	const bin = process.platform === "win32" ? "nsis-lsp.exe" : "nsis-lsp";
 
-  try {
-    const pkgDir = require.resolve(`${pkg}/package.json`);
-    return join(pkgDir, "..", bin);
-  } catch {
-    console.error(
-      `Could not find the binary for ${pkg}.\n` +
-        `This may be caused by a missing optional dependency when installing with --no-optional.\n` +
-        `You can set the NSIS_LSP_BINARY environment variable to point to the binary directly.`,
-    );
-    process.exit(1);
-  }
+	try {
+		const pkgDir = require.resolve(`${pkg}/package.json`);
+		return join(pkgDir, "..", bin);
+	} catch {
+		console.error(
+			`Could not find the binary for ${pkg}.\n` +
+				`This may be caused by a missing optional dependency when installing with --no-optional.\n` +
+				`You can set the NSIS_LSP_BINARY environment variable to point to the binary directly.`,
+		);
+		process.exit(1);
+	}
 }
 
 const binary = getBinaryPath();
 
 try {
-  execFileSync(binary, process.argv.slice(2), {
-    stdio: "inherit",
-  });
+	execFileSync(binary, process.argv.slice(2), {
+		stdio: "inherit",
+	});
 } catch (e) {
-  if (e.status !== null) {
-    process.exit(e.status);
-  }
-  throw e;
+	if (e.status !== null) {
+		process.exit(e.status);
+	}
+	throw e;
 }
