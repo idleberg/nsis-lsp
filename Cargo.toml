@@ -3,7 +3,7 @@ name = "nsis-lsp"
 version = "0.2.2"
 description = "An opinionated language server for NSIS"
 authors = ["Jan T. Sott"]
-repository = "https://github.com/idleberg/language-server-protocol"
+repository = "https://github.com/idleberg/nsis-lsp"
 license = "MIT OR Apache-2.0"
 edition = "2024"
 
