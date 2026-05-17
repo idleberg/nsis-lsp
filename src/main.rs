@@ -5,7 +5,7 @@ mod nsis_data;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use ardent::{DentOptions, Formatter};
+use ardent::{Formatter, FormatterOptions};
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
 	CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
@@ -254,7 +254,7 @@ fn handle_formatting(
 		return Ok(vec![]);
 	};
 
-	let options = DentOptions {
+	let options = FormatterOptions {
 		use_tabs: !params.options.insert_spaces,
 		indent_size: params.options.tab_size as usize,
 		trim_empty_lines: true,
