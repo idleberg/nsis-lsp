@@ -18,7 +18,7 @@ After installation, the `nsis-lsp` binary is available:
 npx nsis-lsp
 ```
 
-The server communicates over stdio using the Language Server Protocol.
+The server communicates over `stdio` using the Language Server Protocol.
 
 ## Supported Platforms
 
