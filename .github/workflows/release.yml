@@ -64,6 +64,13 @@ jobs:
         if: matrix.use-cargo-xwin
         run: cargo install cargo-xwin
 
+      - name: Cache xwin MSVC CRT
+        if: matrix.use-cargo-xwin
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ~/.cache/cargo-xwin
+          key: cargo-xwin-msvc
+
       - name: Build (cross)
         if: matrix.use-cross
         run: cross build --release --target ${{ matrix.target }}
