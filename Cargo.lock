@@ -63,9 +63,9 @@ dependencies = [
 
 [[package]]
 name = "ardent"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9dcd624dccce7db71142149f478b7b85764f29df92642a781af115a20beb0882"
+checksum = "ff8da58dcd781929fc0a7c5466ce049a911c7afcb8629bb4782f2b2ae1f1f653"
 dependencies = [
  "clap",
  "glob",
