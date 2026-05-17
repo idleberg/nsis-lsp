@@ -19,10 +19,16 @@ While still in an **experimental stage**, this language server already provides 
 
 ## Installation
 
-### crates.io
+### Cargo
 
 ```sh
 cargo install nsis-lsp
+```
+
+### Homebrew
+
+```sh
+brew install idleberg/asahi/nsis-lsp
 ```
 
 ### Source
