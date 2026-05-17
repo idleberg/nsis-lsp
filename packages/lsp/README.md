@@ -20,14 +20,6 @@ npx nsis-lsp
 
 The server communicates over stdio using the Language Server Protocol.
 
-### Overriding the binary
-
-Set the `NSIS_LSP_BINARY` environment variable to use a custom binary path:
-
-```sh
-NSIS_LSP_BINARY=/path/to/nsis-lsp npx nsis-lsp
-```
-
 ## Supported Platforms
 
 | Package                      | Platform           |
