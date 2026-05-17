@@ -104,7 +104,7 @@ jobs:
           name: nsis-lsp-bin-${{ matrix.artifact-name }}
           path: target/${{ matrix.target }}/release/nsis-lsp${{ contains(matrix.target, 'windows') && '.exe' || '' }}
 
-  release:
+  create-release:
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -118,7 +118,7 @@ jobs:
         with:
           files: nsis-lsp-*.zip
 
-  publish:
+  publish-to-crates:
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -131,7 +131,7 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-  publish-npm:
+  publish-to-npm:
     needs: build
     runs-on: ubuntu-latest
     steps:
