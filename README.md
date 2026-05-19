@@ -26,6 +26,13 @@ While still in an **experimental stage**, this language server already provides 
 cargo install nsis-lsp
 ```
 
+### Scoop
+
+```sh
+scoop bucket add nsis https://github.com/NSIS-Dev/scoop-nsis
+scoop install nsis/lsp
+```
+
 ### Homebrew
 
 ```sh
