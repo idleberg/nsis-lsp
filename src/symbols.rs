@@ -11,7 +11,6 @@ pub enum NsisSymbolKind {
 }
 
 impl NsisSymbolKind {
-	#[allow(dead_code)]
 	pub fn to_lsp(self) -> SymbolKind {
 		match self {
 			Self::Function => SymbolKind::FUNCTION,
@@ -27,7 +26,6 @@ impl NsisSymbolKind {
 #[derive(Debug, Clone)]
 pub struct SymbolDef {
 	pub name: String,
-	#[allow(dead_code)]
 	pub kind: NsisSymbolKind,
 	pub range: Range,
 	pub selection_range: Range,
