@@ -316,6 +316,190 @@ fn line_end_position(line_num: u32, line: &str) -> Position {
 	Position::new(line_num, byte_to_utf16(line, line.trim_end().len()))
 }
 
+pub fn find_symbol_kind(index: &DocumentIndex, word: &str) -> Option<NsisSymbolKind> {
+	let bare = word.trim_start_matches('$').trim_start_matches('!');
+	for sym in &index.symbols {
+		if sym.name.eq_ignore_ascii_case(bare) || sym.name.eq_ignore_ascii_case(word) {
+			return Some(sym.kind);
+		}
+		for child in &sym.children {
+			if child.name.eq_ignore_ascii_case(bare) || child.name.eq_ignore_ascii_case(word) {
+				return Some(child.kind);
+			}
+		}
+	}
+	None
+}
+
+pub fn find_references(text: &str, name: &str, kind: NsisSymbolKind) -> Vec<Range> {
+	let mut refs = Vec::new();
+	let mut in_block_comment = false;
+
+	for (line_num, line) in text.lines().enumerate() {
+		let line_n = line_num as u32;
+		let (trimmed, still_in_block) = skip_comment_prefix(line.as_bytes(), in_block_comment);
+		in_block_comment = still_in_block;
+		if trimmed.is_empty() {
+			continue;
+		}
+
+		match kind {
+			NsisSymbolKind::Function => {
+				find_call_refs(line, line_n, name, &mut refs);
+			}
+			NsisSymbolKind::Macro => {
+				find_insertmacro_refs(line, line_n, name, &mut refs);
+				find_deref_refs(line, line_n, name, &mut refs);
+			}
+			NsisSymbolKind::Variable => {
+				find_variable_refs(line, line_n, name, &mut refs);
+			}
+			NsisSymbolKind::Define => {
+				find_deref_refs(line, line_n, name, &mut refs);
+			}
+			NsisSymbolKind::Label => {
+				find_goto_refs(line, line_n, name, &mut refs);
+				find_label_jump_refs(line, line_n, name, &mut refs);
+			}
+			NsisSymbolKind::Section => {}
+		}
+	}
+
+	refs
+}
+
+fn find_call_refs(line: &str, line_n: u32, name: &str, refs: &mut Vec<Range>) {
+	let lower = line.trim().to_lowercase();
+	if let Some(rest) = lower.strip_prefix("call ") {
+		let callee = rest.trim();
+		if callee.eq_ignore_ascii_case(name)
+			&& let Some(pos) = line.to_lowercase().rfind(&name.to_lowercase())
+		{
+			let start = byte_to_utf16(line, pos);
+			let end = byte_to_utf16(line, pos + name.len());
+			refs.push(Range::new(
+				Position::new(line_n, start),
+				Position::new(line_n, end),
+			));
+		}
+	}
+}
+
+fn find_insertmacro_refs(line: &str, line_n: u32, name: &str, refs: &mut Vec<Range>) {
+	let lower = line.trim().to_lowercase();
+	if let Some(rest) = lower.strip_prefix("!insertmacro ") {
+		let macro_name = rest.split_whitespace().next().unwrap_or("");
+		if macro_name.eq_ignore_ascii_case(name) {
+			let lower_line = line.to_lowercase();
+			let lower_name = name.to_lowercase();
+			if let Some(im_pos) = lower_line.find("!insertmacro") {
+				let after = im_pos + "!insertmacro".len();
+				if let Some(rel) = lower_line[after..].find(&lower_name) {
+					let pos = after + rel;
+					let start = byte_to_utf16(line, pos);
+					let end = byte_to_utf16(line, pos + name.len());
+					refs.push(Range::new(
+						Position::new(line_n, start),
+						Position::new(line_n, end),
+					));
+				}
+			}
+		}
+	}
+}
+
+fn find_deref_refs(line: &str, line_n: u32, name: &str, refs: &mut Vec<Range>) {
+	let lower_line = line.to_lowercase();
+	let pattern = format!("${{{}}}", name.to_lowercase());
+	let name_offset = 2; // skip "${"
+	let mut search_from = 0;
+	while let Some(pos) = lower_line[search_from..].find(&pattern) {
+		let abs_pos = search_from + pos + name_offset;
+		let start = byte_to_utf16(line, abs_pos);
+		let end = byte_to_utf16(line, abs_pos + name.len());
+		refs.push(Range::new(
+			Position::new(line_n, start),
+			Position::new(line_n, end),
+		));
+		search_from += pos + pattern.len();
+	}
+}
+
+fn find_variable_refs(line: &str, line_n: u32, name: &str, refs: &mut Vec<Range>) {
+	let lower_line = line.to_lowercase();
+	let pattern = format!("${}", name.to_lowercase());
+	let name_offset = 1; // skip "$"
+	let mut search_from = 0;
+	while let Some(pos) = lower_line[search_from..].find(&pattern) {
+		let abs_pos = search_from + pos;
+		let after = abs_pos + pattern.len();
+		// Check it's not ${name} (that's a define/macro deref)
+		if abs_pos + 1 < line.len() && line.as_bytes()[abs_pos + 1] == b'{' {
+			search_from = after;
+			continue;
+		}
+		// Check word boundary after
+		if after < line.len() && is_ident_byte(line.as_bytes()[after]) {
+			search_from = after;
+			continue;
+		}
+		let start = byte_to_utf16(line, abs_pos + name_offset);
+		let end = byte_to_utf16(line, after);
+		refs.push(Range::new(
+			Position::new(line_n, start),
+			Position::new(line_n, end),
+		));
+		search_from = after;
+	}
+}
+
+fn find_goto_refs(line: &str, line_n: u32, name: &str, refs: &mut Vec<Range>) {
+	let lower = line.trim().to_lowercase();
+	if let Some(rest) = lower.strip_prefix("goto ") {
+		let target = rest.trim();
+		if target.eq_ignore_ascii_case(name)
+			&& let Some(pos) = line.to_lowercase().rfind(&name.to_lowercase())
+		{
+			let start = byte_to_utf16(line, pos);
+			let end = byte_to_utf16(line, pos + name.len());
+			refs.push(Range::new(
+				Position::new(line_n, start),
+				Position::new(line_n, end),
+			));
+		}
+	}
+}
+
+fn find_label_jump_refs(line: &str, line_n: u32, name: &str, refs: &mut Vec<Range>) {
+	let lower_line = line.to_lowercase();
+	let lower_name = name.to_lowercase();
+	let words: Vec<&str> = line.split_whitespace().collect();
+	for (i, word) in words.iter().enumerate() {
+		if i == 0 {
+			continue;
+		}
+		let w_lower = word.to_lowercase();
+		if matches!(
+			w_lower.as_str(),
+			"idyes" | "idno" | "idok" | "idcancel" | "idabort" | "idretry" | "idignore"
+		) && let Some(next) = words.get(i + 1)
+			&& next.eq_ignore_ascii_case(name)
+			&& let Some(pos) = lower_line.rfind(&lower_name)
+		{
+			let start = byte_to_utf16(line, pos);
+			let end = byte_to_utf16(line, pos + name.len());
+			refs.push(Range::new(
+				Position::new(line_n, start),
+				Position::new(line_n, end),
+			));
+		}
+	}
+}
+
+fn is_ident_byte(b: u8) -> bool {
+	b.is_ascii_alphanumeric() || b == b'_' || b == b'.'
+}
+
 fn skip_comment_prefix(bytes: &[u8], mut in_block: bool) -> (String, bool) {
 	let mut i = 0;
 	// Skip leading whitespace
@@ -551,5 +735,118 @@ SectionEnd
 	fn parse_section_name_with_flag() {
 		let (name, _) = parse_section_name("/e \"Expanded\"");
 		assert_eq!(name, "Expanded");
+	}
+
+	// ── find_symbol_kind ──
+
+	#[test]
+	fn find_symbol_kind_function() {
+		let idx = index_document("Function myFunc\nFunctionEnd");
+		assert_eq!(
+			find_symbol_kind(&idx, "myFunc"),
+			Some(NsisSymbolKind::Function)
+		);
+	}
+
+	#[test]
+	fn find_symbol_kind_child_label() {
+		let idx = index_document("Function myFunc\n  start:\nFunctionEnd");
+		assert_eq!(find_symbol_kind(&idx, "start"), Some(NsisSymbolKind::Label));
+	}
+
+	#[test]
+	fn find_symbol_kind_not_found() {
+		let idx = index_document("Function myFunc\nFunctionEnd");
+		assert_eq!(find_symbol_kind(&idx, "missing"), None);
+	}
+
+	#[test]
+	fn find_symbol_kind_with_dollar_prefix() {
+		let idx = index_document("Var myVar");
+		assert_eq!(
+			find_symbol_kind(&idx, "$myVar"),
+			Some(NsisSymbolKind::Variable)
+		);
+	}
+
+	// ── find_references ──
+
+	#[test]
+	fn refs_function_call() {
+		let text = "Function myFunc\nFunctionEnd\nCall myFunc";
+		let refs = find_references(text, "myFunc", NsisSymbolKind::Function);
+		assert_eq!(refs.len(), 1);
+		assert_eq!(refs[0].start.line, 2);
+	}
+
+	#[test]
+	fn refs_function_call_case_insensitive() {
+		let text = "call MYFUNC";
+		let refs = find_references(text, "myFunc", NsisSymbolKind::Function);
+		assert_eq!(refs.len(), 1);
+	}
+
+	#[test]
+	fn refs_macro_insertmacro() {
+		let text = "!insertmacro MyMacro arg1";
+		let refs = find_references(text, "MyMacro", NsisSymbolKind::Macro);
+		assert_eq!(refs.len(), 1);
+	}
+
+	#[test]
+	fn refs_macro_deref() {
+		let text = "DetailPrint ${MyMacro}";
+		let refs = find_references(text, "MyMacro", NsisSymbolKind::Macro);
+		assert_eq!(refs.len(), 1);
+	}
+
+	#[test]
+	fn refs_variable() {
+		let text = "StrCpy $myVar \"hello\"\nDetailPrint $myVar";
+		let refs = find_references(text, "myVar", NsisSymbolKind::Variable);
+		assert_eq!(refs.len(), 2);
+	}
+
+	#[test]
+	fn refs_variable_not_deref() {
+		let text = "DetailPrint ${myVar}";
+		let refs = find_references(text, "myVar", NsisSymbolKind::Variable);
+		assert_eq!(refs.is_empty(), true);
+	}
+
+	#[test]
+	fn refs_define_deref() {
+		let text = "DetailPrint ${APP_NAME}\nStrCpy $0 ${APP_NAME}";
+		let refs = find_references(text, "APP_NAME", NsisSymbolKind::Define);
+		assert_eq!(refs.len(), 2);
+	}
+
+	#[test]
+	fn refs_label_goto() {
+		let text = "Goto myLabel";
+		let refs = find_references(text, "myLabel", NsisSymbolKind::Label);
+		assert_eq!(refs.len(), 1);
+	}
+
+	#[test]
+	fn refs_label_messagebox_jump() {
+		let text = "MessageBox MB_YESNO \"Continue?\" IDYES accept";
+		let refs = find_references(text, "accept", NsisSymbolKind::Label);
+		assert_eq!(refs.len(), 1);
+	}
+
+	#[test]
+	fn refs_skips_comments() {
+		let text = "# Call myFunc\nCall myFunc";
+		let refs = find_references(text, "myFunc", NsisSymbolKind::Function);
+		assert_eq!(refs.len(), 1);
+		assert_eq!(refs[0].start.line, 1);
+	}
+
+	#[test]
+	fn refs_empty_for_section() {
+		let text = "Section main\nSectionEnd";
+		let refs = find_references(text, "main", NsisSymbolKind::Section);
+		assert!(refs.is_empty());
 	}
 }

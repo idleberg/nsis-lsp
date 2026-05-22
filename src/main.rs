@@ -9,18 +9,21 @@ use std::sync::LazyLock;
 use ardent::{Formatter, FormatterOptions};
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
+	CodeAction, CodeActionKind, CodeActionParams, CodeActionProviderCapability, CodeActionResponse,
 	CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
 	Diagnostic, DiagnosticSeverity, DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams,
 	DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
 	HoverParams, HoverProviderCapability, Location, LogMessageParams, MarkupContent, MarkupKind,
-	MessageType, OneOf, Position, PublishDiagnosticsParams, Range, ServerCapabilities,
-	ShowMessageParams, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit,
+	MessageType, OneOf, Position, PrepareRenameResponse, PublishDiagnosticsParams, Range,
+	ReferenceParams, RenameOptions, RenameParams, ServerCapabilities, ShowMessageParams,
+	TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, WorkspaceEdit,
 	notification::{
 		DidChangeTextDocument, DidOpenTextDocument, DidSaveTextDocument, LogMessage,
 		Notification as _, PublishDiagnostics, ShowMessage,
 	},
 	request::{
-		Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest, Request as _,
+		CodeActionRequest, Completion, DocumentSymbolRequest, Formatting, GotoDefinition,
+		HoverRequest, PrepareRenameRequest, References, Rename, Request as _,
 	},
 };
 use serde::Deserialize;
@@ -97,6 +100,12 @@ fn main() {
 		}),
 		definition_provider: Some(OneOf::Left(true)),
 		document_symbol_provider: Some(OneOf::Left(true)),
+		references_provider: Some(OneOf::Left(true)),
+		rename_provider: Some(OneOf::Right(RenameOptions {
+			prepare_provider: Some(true),
+			work_done_progress_options: Default::default(),
+		})),
+		code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
 		text_document_sync: Some(TextDocumentSyncCapability::Options(
 			lsp_types::TextDocumentSyncOptions {
 				open_close: Some(true),
@@ -210,6 +219,28 @@ fn handle_request(
 				req.extract::<DocumentSymbolParams>(DocumentSymbolRequest::METHOD)
 			{
 				send_response(connection, id, handle_document_symbols(documents, params));
+			}
+		}
+		References::METHOD => {
+			if let Ok((id, params)) = req.extract::<ReferenceParams>(References::METHOD) {
+				send_response(connection, id, handle_references(documents, params));
+			}
+		}
+		PrepareRenameRequest::METHOD => {
+			if let Ok((id, params)) =
+				req.extract::<lsp_types::TextDocumentPositionParams>(PrepareRenameRequest::METHOD)
+			{
+				send_response(connection, id, handle_prepare_rename(documents, params));
+			}
+		}
+		Rename::METHOD => {
+			if let Ok((id, params)) = req.extract::<RenameParams>(Rename::METHOD) {
+				send_response(connection, id, handle_rename(documents, params));
+			}
+		}
+		CodeActionRequest::METHOD => {
+			if let Ok((id, params)) = req.extract::<CodeActionParams>(CodeActionRequest::METHOD) {
+				send_response(connection, id, handle_code_actions(params));
 			}
 		}
 		_ => {}
@@ -635,6 +666,218 @@ fn symbol_def_to_document_symbol(sym: &symbols::SymbolDef) -> DocumentSymbol {
 			)
 		},
 	}
+}
+
+// ── Find References ──
+
+fn handle_references(
+	documents: &HashMap<String, DocumentState>,
+	params: ReferenceParams,
+) -> Option<Vec<Location>> {
+	let uri = &params.text_document_position.text_document.uri;
+	let doc = documents.get(&uri.to_string())?;
+	let pos = params.text_document_position.position;
+	let word = word_at_position(&doc.text, pos.line, pos.character)?;
+	let bare = word.trim_start_matches('$').trim_start_matches('!');
+	let kind = symbols::find_symbol_kind(&doc.index, &word)?;
+
+	let mut locations = Vec::new();
+
+	if params.context.include_declaration
+		&& let Some(GotoDefinitionResponse::Scalar(loc)) =
+			find_symbol_location(uri, &doc.index, bare)
+	{
+		locations.push(loc);
+	}
+
+	for (doc_uri, doc_state) in documents {
+		let parsed_uri: lsp_types::Uri = doc_uri.parse().ok()?;
+		for range in symbols::find_references(&doc_state.text, bare, kind) {
+			locations.push(Location {
+				uri: parsed_uri.clone(),
+				range,
+			});
+		}
+	}
+
+	if locations.is_empty() {
+		None
+	} else {
+		Some(locations)
+	}
+}
+
+// ── Rename ──
+
+fn handle_prepare_rename(
+	documents: &HashMap<String, DocumentState>,
+	params: lsp_types::TextDocumentPositionParams,
+) -> Option<PrepareRenameResponse> {
+	let uri = &params.text_document.uri;
+	let doc = documents.get(&uri.to_string())?;
+	let pos = params.position;
+	let word = word_at_position(&doc.text, pos.line, pos.character)?;
+	let bare = word.trim_start_matches('$').trim_start_matches('!');
+
+	if is_builtin(&word) {
+		return None;
+	}
+
+	symbols::find_symbol_kind(&doc.index, &word)?;
+
+	let line_str = doc.text.lines().nth(pos.line as usize)?;
+	let col = utf16_to_byte_offset(line_str, pos.character);
+	let bytes = line_str.as_bytes();
+	let mut start = col;
+	let mut end = col;
+	while start > 0 && is_ident_char(bytes[start - 1]) {
+		start -= 1;
+	}
+	while end < bytes.len() && is_ident_char(bytes[end]) {
+		end += 1;
+	}
+
+	let range = Range::new(
+		Position::new(pos.line, byte_to_utf16_offset(line_str, start)),
+		Position::new(pos.line, byte_to_utf16_offset(line_str, end)),
+	);
+
+	Some(PrepareRenameResponse::RangeWithPlaceholder {
+		range,
+		placeholder: bare.to_string(),
+	})
+}
+
+fn handle_rename(
+	documents: &HashMap<String, DocumentState>,
+	params: RenameParams,
+) -> Option<WorkspaceEdit> {
+	let uri = &params.text_document_position.text_document.uri;
+	let doc = documents.get(&uri.to_string())?;
+	let pos = params.text_document_position.position;
+	let word = word_at_position(&doc.text, pos.line, pos.character)?;
+	let bare = word.trim_start_matches('$').trim_start_matches('!');
+	let kind = symbols::find_symbol_kind(&doc.index, &word)?;
+
+	if is_builtin(&word) {
+		return None;
+	}
+
+	let new_name = &params.new_name;
+
+	#[allow(clippy::mutable_key_type)]
+	let mut changes: HashMap<lsp_types::Uri, Vec<TextEdit>> = HashMap::new();
+
+	for (doc_uri, doc_state) in documents {
+		let parsed_uri: lsp_types::Uri = doc_uri.parse().ok()?;
+
+		let mut edits: Vec<TextEdit> = symbols::find_references(&doc_state.text, bare, kind)
+			.into_iter()
+			.map(|range| TextEdit {
+				range,
+				new_text: new_name.clone(),
+			})
+			.collect();
+
+		for sym in &doc_state.index.symbols {
+			if sym.name.eq_ignore_ascii_case(bare) && sym.kind == kind {
+				edits.push(TextEdit {
+					range: sym.selection_range,
+					new_text: new_name.clone(),
+				});
+			}
+			for child in &sym.children {
+				if child.name.eq_ignore_ascii_case(bare) && child.kind == kind {
+					edits.push(TextEdit {
+						range: child.selection_range,
+						new_text: new_name.clone(),
+					});
+				}
+			}
+		}
+
+		if !edits.is_empty() {
+			changes.insert(parsed_uri, edits);
+		}
+	}
+
+	Some(WorkspaceEdit {
+		changes: Some(changes),
+		..Default::default()
+	})
+}
+
+fn is_builtin(word: &str) -> bool {
+	let bare = word.trim_start_matches('$');
+	for (var, _) in nsis_data::BUILTIN_VARIABLES {
+		let v = var.trim_start_matches('$');
+		if v.eq_ignore_ascii_case(bare) {
+			return true;
+		}
+	}
+	for (name, _) in nsis_data::CONSTANTS {
+		if name.eq_ignore_ascii_case(word) {
+			return true;
+		}
+	}
+	nsis_data::lookup_doc(word).is_some()
+}
+
+// ── Code Actions ──
+
+const DEPRECATED_REPLACEMENTS: &[(&str, &str)] = &[
+	("SubSection", "SectionGroup"),
+	("SubSectionEnd", "SectionGroupEnd"),
+];
+
+fn handle_code_actions(params: CodeActionParams) -> Option<CodeActionResponse> {
+	let uri = params.text_document.uri;
+	let mut actions = Vec::new();
+
+	for diag in &params.context.diagnostics {
+		if diag.source.as_deref() != Some("nsis-lsp") || !diag.message.contains("deprecated") {
+			continue;
+		}
+
+		let deprecated = diag
+			.message
+			.strip_prefix("'")
+			.and_then(|s| s.strip_suffix("' is deprecated"))?;
+
+		let replacement = DEPRECATED_REPLACEMENTS
+			.iter()
+			.find(|(old, _)| old.eq_ignore_ascii_case(deprecated))
+			.map(|(_, new)| *new)?;
+
+		#[allow(clippy::mutable_key_type)]
+		let mut changes = HashMap::new();
+		changes.insert(
+			uri.clone(),
+			vec![TextEdit {
+				range: diag.range,
+				new_text: replacement.to_string(),
+			}],
+		);
+
+		actions.push(CodeAction {
+			title: format!("Replace with '{replacement}'"),
+			kind: Some(CodeActionKind::QUICKFIX),
+			diagnostics: Some(vec![diag.clone()]),
+			edit: Some(WorkspaceEdit {
+				changes: Some(changes),
+				..Default::default()
+			}),
+			is_preferred: Some(true),
+			..Default::default()
+		});
+	}
+
+	Some(
+		actions
+			.into_iter()
+			.map(lsp_types::CodeActionOrCommand::CodeAction)
+			.collect(),
+	)
 }
 
 // ── Utilities ──
