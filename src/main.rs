@@ -10,16 +10,18 @@ use ardent::{Formatter, FormatterOptions};
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
 	CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
-	Diagnostic, DiagnosticSeverity, DocumentFormattingParams, GotoDefinitionParams,
-	GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability, Location,
-	LogMessageParams, MarkupContent, MarkupKind, MessageType, OneOf, Position,
-	PublishDiagnosticsParams, Range, ServerCapabilities, ShowMessageParams,
-	TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit,
+	Diagnostic, DiagnosticSeverity, DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams,
+	DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
+	HoverParams, HoverProviderCapability, Location, LogMessageParams, MarkupContent, MarkupKind,
+	MessageType, OneOf, Position, PublishDiagnosticsParams, Range, ServerCapabilities,
+	ShowMessageParams, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit,
 	notification::{
 		DidChangeTextDocument, DidOpenTextDocument, DidSaveTextDocument, LogMessage,
 		Notification as _, PublishDiagnostics, ShowMessage,
 	},
-	request::{Completion, Formatting, GotoDefinition, HoverRequest, Request as _},
+	request::{
+		Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest, Request as _,
+	},
 };
 use serde::Deserialize;
 
@@ -94,6 +96,7 @@ fn main() {
 			..Default::default()
 		}),
 		definition_provider: Some(OneOf::Left(true)),
+		document_symbol_provider: Some(OneOf::Left(true)),
 		text_document_sync: Some(TextDocumentSyncCapability::Options(
 			lsp_types::TextDocumentSyncOptions {
 				open_close: Some(true),
@@ -200,6 +203,13 @@ fn handle_request(
 		GotoDefinition::METHOD => {
 			if let Ok((id, params)) = req.extract::<GotoDefinitionParams>(GotoDefinition::METHOD) {
 				send_response(connection, id, handle_goto_definition(documents, params));
+			}
+		}
+		DocumentSymbolRequest::METHOD => {
+			if let Ok((id, params)) =
+				req.extract::<DocumentSymbolParams>(DocumentSymbolRequest::METHOD)
+			{
+				send_response(connection, id, handle_document_symbols(documents, params));
 			}
 		}
 		_ => {}
@@ -576,6 +586,55 @@ fn find_symbol_location(
 		}
 	}
 	None
+}
+
+// ── Document Symbols ──
+
+fn handle_document_symbols(
+	documents: &HashMap<String, DocumentState>,
+	params: DocumentSymbolParams,
+) -> Option<DocumentSymbolResponse> {
+	let doc = documents.get(&params.text_document.uri.to_string())?;
+	let symbols = doc
+		.index
+		.symbols
+		.iter()
+		.map(symbol_def_to_document_symbol)
+		.collect();
+	Some(DocumentSymbolResponse::Nested(symbols))
+}
+
+fn symbol_def_to_document_symbol(sym: &symbols::SymbolDef) -> DocumentSymbol {
+	let detail = if sym.kind == symbols::NsisSymbolKind::Function && sym.name.starts_with('.') {
+		Some("callback".to_string())
+	} else {
+		None
+	};
+
+	#[allow(deprecated)]
+	DocumentSymbol {
+		name: if sym.name.is_empty() {
+			"(unnamed)".to_string()
+		} else {
+			sym.name.clone()
+		},
+		detail,
+		kind: sym.kind.to_lsp(),
+		tags: None,
+		deprecated: None,
+		range: sym.range,
+		selection_range: sym.selection_range,
+		children: if sym.children.is_empty() {
+			None
+		} else {
+			Some(
+				sym.children
+					.iter()
+					.map(symbol_def_to_document_symbol)
+					.collect(),
+			)
+		},
+	}
 }
 
 // ── Utilities ──
