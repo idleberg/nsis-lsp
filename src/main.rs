@@ -1,6 +1,7 @@
 mod compiler;
 mod diagnostics;
 mod nsis_data;
+mod symbols;
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -23,6 +24,19 @@ use lsp_types::{
 use serde::Deserialize;
 
 use compiler::PreprocessMode;
+use symbols::DocumentIndex;
+
+struct DocumentState {
+	text: String,
+	index: DocumentIndex,
+}
+
+impl DocumentState {
+	fn new(text: String) -> Self {
+		let index = symbols::index_document(&text);
+		Self { text, index }
+	}
+}
 
 #[derive(Debug, Default, Deserialize)]
 struct InitOptions {
@@ -135,7 +149,7 @@ fn main() {
 		);
 	}
 
-	let mut documents: HashMap<String, String> = HashMap::new();
+	let mut documents: HashMap<String, DocumentState> = HashMap::new();
 
 	for msg in &connection.receiver {
 		match msg {
@@ -155,7 +169,11 @@ fn main() {
 	io_threads.join().ok();
 }
 
-fn handle_request(connection: &Connection, req: Request, documents: &HashMap<String, String>) {
+fn handle_request(
+	connection: &Connection,
+	req: Request,
+	documents: &HashMap<String, DocumentState>,
+) {
 	match req.method.as_str() {
 		Formatting::METHOD => {
 			if let Ok((id, params)) = req.extract::<DocumentFormattingParams>(Formatting::METHOD) {
@@ -191,25 +209,26 @@ fn handle_request(connection: &Connection, req: Request, documents: &HashMap<Str
 fn handle_notification(
 	connection: &Connection,
 	not: Notification,
-	documents: &mut HashMap<String, String>,
+	documents: &mut HashMap<String, DocumentState>,
 	state: &LspState,
 ) {
 	if let Some(params) = cast_notification::<DidOpenTextDocument>(not.clone()) {
 		let uri = params.text_document.uri;
-		documents.insert(uri.to_string(), params.text_document.text.clone());
-		publish_diagnostics(connection, uri, &params.text_document.text);
+		let text = params.text_document.text;
+		publish_diagnostics(connection, uri.clone(), &text);
+		documents.insert(uri.to_string(), DocumentState::new(text));
 	} else if let Some(params) = cast_notification::<DidChangeTextDocument>(not.clone())
 		&& let Some(change) = params.content_changes.into_iter().last()
 	{
 		let uri = params.text_document.uri;
-		documents.insert(uri.to_string(), change.text.clone());
-		publish_diagnostics(connection, uri, &change.text);
+		publish_diagnostics(connection, uri.clone(), &change.text);
+		documents.insert(uri.to_string(), DocumentState::new(change.text));
 	} else if let Some(params) = cast_notification::<DidSaveTextDocument>(not)
 		&& state.diagnostics_on_save
 	{
 		let uri = params.text_document.uri;
-		if let Some(text) = documents.get(&uri.to_string()) {
-			run_compiler_diagnostics(connection, state, &uri, text);
+		if let Some(doc) = documents.get(&uri.to_string()) {
+			run_compiler_diagnostics(connection, state, &uri, &doc.text);
 		}
 	}
 }
@@ -246,13 +265,14 @@ fn run_compiler_diagnostics(
 // ── Formatting ──
 
 fn handle_formatting(
-	documents: &HashMap<String, String>,
+	documents: &HashMap<String, DocumentState>,
 	params: DocumentFormattingParams,
 ) -> Result<Vec<TextEdit>, (lsp_types::Uri, String)> {
 	let uri = params.text_document.uri;
-	let Some(text) = documents.get(&uri.to_string()) else {
+	let Some(doc) = documents.get(&uri.to_string()) else {
 		return Ok(vec![]);
 	};
+	let text = &doc.text;
 
 	let options = FormatterOptions {
 		use_tabs: !params.options.insert_spaces,
@@ -285,13 +305,13 @@ fn handle_formatting(
 
 // ── Hover ──
 
-fn handle_hover(documents: &HashMap<String, String>, params: HoverParams) -> Option<Hover> {
+fn handle_hover(documents: &HashMap<String, DocumentState>, params: HoverParams) -> Option<Hover> {
 	let uri = params
 		.text_document_position_params
 		.text_document
 		.uri
 		.to_string();
-	let text = documents.get(&uri)?;
+	let text = &documents.get(&uri)?.text;
 	let pos = params.text_document_position_params.position;
 	let word = word_at_position(text, pos.line, pos.character)?;
 
@@ -394,7 +414,7 @@ static COMPLETION_ITEMS: LazyLock<Vec<CompletionItem>> = LazyLock::new(|| {
 });
 
 fn handle_completion(
-	_documents: &HashMap<String, String>,
+	_documents: &HashMap<String, DocumentState>,
 	_params: CompletionParams,
 ) -> Option<CompletionResponse> {
 	Some(CompletionResponse::Array(COMPLETION_ITEMS.clone()))
@@ -523,66 +543,39 @@ fn compute_diagnostics(text: &str) -> Vec<Diagnostic> {
 // ── Go to Definition ──
 
 fn handle_goto_definition(
-	documents: &HashMap<String, String>,
+	documents: &HashMap<String, DocumentState>,
 	params: GotoDefinitionParams,
 ) -> Option<GotoDefinitionResponse> {
 	let uri = &params.text_document_position_params.text_document.uri;
-	let text = documents.get(&uri.to_string())?;
+	let doc = documents.get(&uri.to_string())?;
 	let pos = params.text_document_position_params.position;
-	let word = word_at_position(text, pos.line, pos.character)?;
+	let word = word_at_position(&doc.text, pos.line, pos.character)?;
 
-	for (line_num, line) in text.lines().enumerate() {
-		let lower = line.trim().to_lowercase();
+	find_symbol_location(uri, &doc.index, &word)
+}
 
-		if lower.starts_with("function ") {
-			let name = line.trim()[9..].trim();
-			if name.eq_ignore_ascii_case(&word) {
-				return Some(GotoDefinitionResponse::Scalar(Location {
-					uri: uri.clone(),
-					range: line_range(line_num, line),
-				}));
-			}
+fn find_symbol_location(
+	uri: &lsp_types::Uri,
+	index: &DocumentIndex,
+	word: &str,
+) -> Option<GotoDefinitionResponse> {
+	for sym in &index.symbols {
+		if sym.name.eq_ignore_ascii_case(word) {
+			return Some(GotoDefinitionResponse::Scalar(Location {
+				uri: uri.clone(),
+				range: sym.selection_range,
+			}));
 		}
-
-		if lower.starts_with("!macro ") {
-			let rest = line.trim()[7..].trim();
-			let macro_name = rest.split_whitespace().next().unwrap_or("");
-			if macro_name.eq_ignore_ascii_case(&word) {
+		for child in &sym.children {
+			if child.name.eq_ignore_ascii_case(word) {
 				return Some(GotoDefinitionResponse::Scalar(Location {
 					uri: uri.clone(),
-					range: line_range(line_num, line),
-				}));
-			}
-		}
-
-		let trimmed = line.trim();
-		if trimmed.ends_with(':')
-			&& !trimmed.contains(' ')
-			&& !trimmed.starts_with(';')
-			&& !trimmed.starts_with('#')
-		{
-			let label = &trimmed[..trimmed.len() - 1];
-			if label.eq_ignore_ascii_case(&word) {
-				return Some(GotoDefinitionResponse::Scalar(Location {
-					uri: uri.clone(),
-					range: line_range(line_num, line),
+					range: child.selection_range,
 				}));
 			}
 		}
 	}
-
 	None
-}
-
-fn line_range(line_num: usize, line: &str) -> Range {
-	let leading = line.len() - line.trim_start().len();
-	Range::new(
-		Position::new(line_num as u32, byte_to_utf16_offset(line, leading)),
-		Position::new(
-			line_num as u32,
-			byte_to_utf16_offset(line, line.trim_end().len()),
-		),
-	)
 }
 
 // ── Utilities ──
@@ -976,16 +969,5 @@ mod tests {
 	#[test]
 	fn hover_unknown() {
 		assert!(hover_for_word("__nonexistent__").is_none());
-	}
-
-	// ── line_range ──
-
-	#[test]
-	fn line_range_with_leading_whitespace() {
-		let line = "  Section main";
-		let range = line_range(3, line);
-		assert_eq!(range.start.line, 3);
-		assert_eq!(range.start.character, 2);
-		assert_eq!(range.end.character, 14);
 	}
 }
