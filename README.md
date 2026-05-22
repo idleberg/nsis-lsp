@@ -11,12 +11,17 @@
 
 While still in an **experimental stage**, this language server already provides some useful features:
 
-- syntax highlighting
-- completions
+- code actions
 - code formatting
+- compiler diagnostics
+- completions
+- document symbols
+- find references
 - go-to-definition
 - on-hover information
-- compiler diagnostics
+- rename symbol
+- signature help
+- syntax highlighting
 
 ## Installation
 
