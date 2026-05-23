@@ -1,6 +1,6 @@
 [package]
 name = "nsis-lsp"
-version = "0.3.0"
+version = "0.3.1"
 description = "An opinionated language server for NSIS"
 authors = ["Jan T. Sott"]
 repository = "https://github.com/idleberg/nsis-lsp"
