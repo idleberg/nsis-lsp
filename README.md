@@ -62,6 +62,7 @@ The language server accepts settings via LSP `initializationOptions`:
 | ----------------------------- | ---------------- | ------- | --------------------------------------------------------------------------------------- |
 | `diagnostics.preprocess_mode` | `string \| null` | `"ppo"` | Preprocessor mode for `makensis`: `"ppo"`, `"safe_ppo"`, or `null` for full compilation |
 | `diagnostics.enabled_on_save` | `boolean`        | `true`  | Run compiler diagnostics on save                                                        |
+| `formatter.print_width`       | `number`         | `0`     | Maximum line width before breaking with `\` continuations (`0` disables wrapping)       |
 | `makensis.path`               | `string`         | `""`    | Custom path to the `makensis` binary (uses `PATH` when empty)                           |
 
 ## License
