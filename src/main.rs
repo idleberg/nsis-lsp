@@ -50,7 +50,15 @@ struct InitOptions {
 	#[serde(default)]
 	diagnostics: DiagnosticsOptions,
 	#[serde(default)]
+	formatter: FormatterInitOptions,
+	#[serde(default)]
 	makensis: MakensisOptions,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FormatterInitOptions {
+	#[serde(default)]
+	print_width: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,6 +96,7 @@ struct LspState {
 	makensis_path: Option<String>,
 	preprocess_mode: PreprocessMode,
 	diagnostics_on_save: bool,
+	print_width: usize,
 }
 
 fn main() {
@@ -146,6 +155,7 @@ fn main() {
 			options.diagnostics.preprocess_mode.as_deref(),
 		),
 		diagnostics_on_save: options.diagnostics.enabled_on_save,
+		print_width: options.formatter.print_width,
 	};
 
 	log_message(
@@ -176,7 +186,7 @@ fn main() {
 				if connection.handle_shutdown(&req).unwrap_or(true) {
 					break;
 				}
-				handle_request(&connection, req, &documents);
+				handle_request(&connection, req, &documents, &state);
 			}
 			Message::Notification(not) => {
 				handle_notification(&connection, not, &mut documents, &state);
@@ -192,11 +202,12 @@ fn handle_request(
 	connection: &Connection,
 	req: Request,
 	documents: &HashMap<String, DocumentState>,
+	state: &LspState,
 ) {
 	match req.method.as_str() {
 		Formatting::METHOD => {
 			if let Ok((id, params)) = req.extract::<DocumentFormattingParams>(Formatting::METHOD) {
-				match handle_formatting(documents, params) {
+				match handle_formatting(documents, params, state.print_width) {
 					Ok(edits) => send_response(connection, id, edits),
 					Err((uri, msg)) => {
 						publish_format_error(connection, uri, &msg);
@@ -322,6 +333,7 @@ fn run_compiler_diagnostics(
 fn handle_formatting(
 	documents: &HashMap<String, DocumentState>,
 	params: DocumentFormattingParams,
+	print_width: usize,
 ) -> Result<Vec<TextEdit>, (lsp_types::Uri, String)> {
 	let uri = params.text_document.uri;
 	let Some(doc) = documents.get(&uri.to_string()) else {
@@ -333,7 +345,8 @@ fn handle_formatting(
 		use_tabs: !params.options.insert_spaces,
 		indent_size: params.options.tab_size as usize,
 		trim_empty_lines: true,
-		end_of_lines: None,
+		end_of_line: None,
+		print_width,
 	};
 
 	let Ok(formatter) = Formatter::new(options) else {
