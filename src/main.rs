@@ -347,6 +347,7 @@ fn handle_formatting(
 		trim_empty_lines: true,
 		end_of_line: None,
 		print_width,
+		single_quote: false,
 	};
 
 	let Ok(formatter) = Formatter::new(options) else {
