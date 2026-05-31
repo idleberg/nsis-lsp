@@ -1,6 +1,6 @@
 [package]
 name = "nsis-lsp"
-version = "0.4.2"
+version = "0.4.3"
 description = "An opinionated language server for NSIS"
 authors = ["Jan T. Sott"]
 repository = "https://github.com/idleberg/nsis-lsp"
@@ -12,7 +12,7 @@ name = "nsis-lsp"
 path = "src/main.rs"
 
 [dependencies]
-ardent = "0.8"
+ardent = "0.9"
 lsp-server = "0.7"
 lsp-types = "0.97"
 regex = "1"
