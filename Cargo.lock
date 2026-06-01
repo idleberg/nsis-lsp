@@ -63,9 +63,9 @@ dependencies = [
 
 [[package]]
 name = "ardent"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9af7def5b60be360d078e00a0e6d8e3818de1575cb171343f28303222469b682"
+checksum = "45f4521032a49d50e6dc6342e328e429273793e8fd1b7e694053dab350e5d915"
 dependencies = [
  "clap",
  "glob",
@@ -212,7 +212,7 @@ checksum = "6b947ae49db0d222b1dbc6b113ce7248a3fc3a6ca21b696717bfc000ba4484d8"
 
 [[package]]
 name = "nsis-lsp"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "ardent",
  "lsp-server",
