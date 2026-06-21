@@ -6,7 +6,7 @@ mod symbols;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use ardent::{Formatter, FormatterOptions};
+use ardent::{EndOfLine, Formatter, FormatterOptions};
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
 	CodeAction, CodeActionKind, CodeActionParams, CodeActionProviderCapability, CodeActionResponse,
@@ -58,7 +58,13 @@ struct InitOptions {
 #[derive(Debug, Default, Deserialize)]
 struct FormatterInitOptions {
 	#[serde(default)]
+	end_of_line: Option<String>,
+	#[serde(default)]
 	print_width: usize,
+	#[serde(default = "default_true")]
+	trim_empty_lines: bool,
+	#[serde(default)]
+	single_quote: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,7 +102,10 @@ struct LspState {
 	makensis_path: Option<String>,
 	preprocess_mode: PreprocessMode,
 	diagnostics_on_save: bool,
+	end_of_line: Option<EndOfLine>,
 	print_width: usize,
+	trim_empty_lines: bool,
+	single_quote: bool,
 }
 
 fn main() {
@@ -149,13 +158,22 @@ fn main() {
 		.and_then(|v| serde_json::from_value(v.clone()).ok())
 		.unwrap_or_default();
 
+	let end_of_line = match options.formatter.end_of_line.as_deref() {
+		Some("crlf") => Some(EndOfLine::Crlf),
+		Some("lf") => Some(EndOfLine::Lf),
+		_ => None,
+	};
+
 	let state = LspState {
 		makensis_path: compiler::find_makensis(&options.makensis.path),
 		preprocess_mode: PreprocessMode::from_option(
 			options.diagnostics.preprocess_mode.as_deref(),
 		),
 		diagnostics_on_save: options.diagnostics.enabled_on_save,
+		end_of_line,
 		print_width: options.formatter.print_width,
+		trim_empty_lines: options.formatter.trim_empty_lines,
+		single_quote: options.formatter.single_quote,
 	};
 
 	log_message(
@@ -207,7 +225,7 @@ fn handle_request(
 	match req.method.as_str() {
 		Formatting::METHOD => {
 			if let Ok((id, params)) = req.extract::<DocumentFormattingParams>(Formatting::METHOD) {
-				match handle_formatting(documents, params, state.print_width) {
+				match handle_formatting(documents, params, state) {
 					Ok(edits) => send_response(connection, id, edits),
 					Err((uri, msg)) => {
 						publish_format_error(connection, uri, &msg);
@@ -333,7 +351,7 @@ fn run_compiler_diagnostics(
 fn handle_formatting(
 	documents: &HashMap<String, DocumentState>,
 	params: DocumentFormattingParams,
-	print_width: usize,
+	state: &LspState,
 ) -> Result<Vec<TextEdit>, (lsp_types::Uri, String)> {
 	let uri = params.text_document.uri;
 	let Some(doc) = documents.get(&uri.to_string()) else {
@@ -344,10 +362,10 @@ fn handle_formatting(
 	let options = FormatterOptions {
 		use_tabs: !params.options.insert_spaces,
 		indent_size: params.options.tab_size as usize,
-		trim_empty_lines: true,
-		end_of_line: None,
-		print_width,
-		single_quote: false,
+		trim_empty_lines: state.trim_empty_lines,
+		end_of_line: state.end_of_line.clone(),
+		print_width: state.print_width,
+		single_quote: state.single_quote,
 	};
 
 	let Ok(formatter) = Formatter::new(options) else {
