@@ -1,4 +1,5 @@
 mod compiler;
+mod context;
 mod diagnostics;
 mod nsis_data;
 mod symbols;
@@ -31,6 +32,7 @@ use lsp_types::{
 use serde::Deserialize;
 
 use compiler::PreprocessMode;
+use context::SyntaxContext;
 use symbols::DocumentIndex;
 
 struct DocumentState {
@@ -449,7 +451,9 @@ fn hover_for_word(word: &str) -> Option<String> {
 
 // ── Completion ──
 
-static COMPLETION_ITEMS: LazyLock<Vec<CompletionItem>> = LazyLock::new(|| {
+/// Items that are only meaningful in code position: commands, preprocessor
+/// keywords, callbacks and bare flag constants.
+static CODE_ITEMS: LazyLock<Vec<CompletionItem>> = LazyLock::new(|| {
 	let mut items = Vec::new();
 
 	for entry in nsis_data::DOCS.values() {
@@ -476,18 +480,6 @@ static COMPLETION_ITEMS: LazyLock<Vec<CompletionItem>> = LazyLock::new(|| {
 		});
 	}
 
-	for (var, desc) in nsis_data::BUILTIN_VARIABLES {
-		let (filter_text, insert_text) = trigger_prefix_texts(var);
-		items.push(CompletionItem {
-			label: var.to_string(),
-			kind: Some(CompletionItemKind::VARIABLE),
-			filter_text,
-			insert_text,
-			detail: Some(desc.to_string()),
-			..Default::default()
-		});
-	}
-
 	for (name, desc) in nsis_data::CONSTANTS {
 		items.push(CompletionItem {
 			label: name.to_string(),
@@ -500,11 +492,52 @@ static COMPLETION_ITEMS: LazyLock<Vec<CompletionItem>> = LazyLock::new(|| {
 	items
 });
 
+/// Items that interpolate inside a quoted string, and are therefore valid in
+/// both string and code position.
+static INTERPOLATED_ITEMS: LazyLock<Vec<CompletionItem>> = LazyLock::new(|| {
+	nsis_data::BUILTIN_VARIABLES
+		.iter()
+		.map(|(var, desc)| {
+			let (filter_text, insert_text) = trigger_prefix_texts(var);
+			CompletionItem {
+				label: var.to_string(),
+				kind: Some(CompletionItemKind::VARIABLE),
+				filter_text,
+				insert_text,
+				detail: Some(desc.to_string()),
+				..Default::default()
+			}
+		})
+		.collect()
+});
+
 fn handle_completion(
-	_documents: &HashMap<String, DocumentState>,
-	_params: CompletionParams,
+	documents: &HashMap<String, DocumentState>,
+	params: CompletionParams,
 ) -> Option<CompletionResponse> {
-	Some(CompletionResponse::Array(COMPLETION_ITEMS.clone()))
+	let uri = params.text_document_position.text_document.uri.as_str();
+	let pos = params.text_document_position.position;
+	let doc = documents.get(uri)?;
+
+	let items = match completion_context(&doc.text, pos) {
+		// Nothing is code inside a comment.
+		SyntaxContext::Comment => Vec::new(),
+		// Only `$VAR`, `${DEFINE}` and `$(LangString)` expand inside a string.
+		SyntaxContext::String => INTERPOLATED_ITEMS.clone(),
+		SyntaxContext::Code => {
+			let mut items = CODE_ITEMS.clone();
+			items.extend(INTERPOLATED_ITEMS.iter().cloned());
+			items
+		}
+	};
+
+	Some(CompletionResponse::Array(items))
+}
+
+fn completion_context(text: &str, pos: Position) -> SyntaxContext {
+	let line_str = text.lines().nth(pos.line as usize).unwrap_or("");
+	let col = utf16_to_byte_offset(line_str, pos.character);
+	context::context_at(text, pos.line, col)
 }
 
 fn trigger_prefix_texts(name: &str) -> (Option<String>, Option<String>) {
@@ -1072,56 +1105,7 @@ fn handle_code_actions(params: CodeActionParams) -> Option<CodeActionResponse> {
 // ── Utilities ──
 
 fn is_in_comment(text: &str, line: u32, col: usize) -> bool {
-	let target = line as usize;
-	let mut in_block_comment = false;
-
-	for (i, line_str) in text.lines().enumerate() {
-		if i > target && !in_block_comment {
-			return false;
-		}
-
-		let bytes = line_str.as_bytes();
-		let mut j = 0;
-
-		while j < bytes.len() {
-			if in_block_comment {
-				if j + 1 < bytes.len() && bytes[j] == b'*' && bytes[j + 1] == b'/' {
-					if i == target && col <= j + 1 {
-						return true;
-					}
-					in_block_comment = false;
-					j += 2;
-					continue;
-				}
-				if i == target && j == col {
-					return true;
-				}
-				j += 1;
-				continue;
-			}
-
-			if bytes[j] == b'#' || bytes[j] == b';' {
-				return i == target && col >= j;
-			}
-
-			if j + 1 < bytes.len() && bytes[j] == b'/' && bytes[j + 1] == b'*' {
-				in_block_comment = true;
-				if i == target && (col == j || col == j + 1) {
-					return true;
-				}
-				j += 2;
-				continue;
-			}
-
-			j += 1;
-		}
-
-		if i == target && !in_block_comment {
-			return false;
-		}
-	}
-
-	in_block_comment
+	context::context_at(text, line, col) == SyntaxContext::Comment
 }
 
 fn word_at_position(text: &str, line: u32, character: u32) -> Option<String> {
@@ -1402,6 +1386,82 @@ mod tests {
 	fn word_at_position_in_comment_returns_none() {
 		let text = "# DetailPrint hello";
 		assert_eq!(word_at_position(text, 0, 5), None);
+	}
+
+	// ── handle_completion ──
+
+	const TEST_URI: &str = "file:///test.nsi";
+
+	fn completion_labels(text: &str, line: u32, character: u32) -> Vec<String> {
+		let mut documents = HashMap::new();
+		documents.insert(TEST_URI.to_string(), DocumentState::new(text.to_string()));
+
+		let params = CompletionParams {
+			text_document_position: lsp_types::TextDocumentPositionParams {
+				text_document: lsp_types::TextDocumentIdentifier {
+					uri: TEST_URI.parse().unwrap(),
+				},
+				position: Position { line, character },
+			},
+			work_done_progress_params: Default::default(),
+			partial_result_params: Default::default(),
+			context: None,
+		};
+
+		match handle_completion(&documents, params) {
+			Some(CompletionResponse::Array(items)) => items.into_iter().map(|i| i.label).collect(),
+			other => panic!("unexpected completion response: {other:?}"),
+		}
+	}
+
+	#[test]
+	fn completion_in_code_offers_commands_and_variables() {
+		let labels = completion_labels("MessageBox MB_OK \"hi\"\n", 1, 0);
+		assert!(labels.iter().any(|l| l == "DetailPrint"));
+		assert!(labels.iter().any(|l| l == "!define"));
+		assert!(labels.iter().any(|l| l == "MB_OK"));
+		assert!(labels.iter().any(|l| l == "$INSTDIR"));
+	}
+
+	#[test]
+	fn completion_in_string_offers_variables_only() {
+		let labels = completion_labels("MessageBox MB_OK \"hello \"", 0, 24);
+		assert!(labels.iter().any(|l| l == "$INSTDIR"));
+		assert!(!labels.iter().any(|l| l == "DetailPrint"));
+		assert!(!labels.iter().any(|l| l == "!define"));
+		assert!(!labels.iter().any(|l| l == "MB_OK"));
+	}
+
+	#[test]
+	fn completion_in_comment_is_empty() {
+		assert!(completion_labels("; a comment", 0, 5).is_empty());
+		assert!(completion_labels("/* block */", 0, 5).is_empty());
+	}
+
+	#[test]
+	fn completion_after_string_offers_commands_again() {
+		let labels = completion_labels("MessageBox MB_OK \"hi\" ", 0, 22);
+		assert!(labels.iter().any(|l| l == "DetailPrint"));
+	}
+
+	#[test]
+	fn completion_for_unknown_document_is_none() {
+		let documents: HashMap<String, DocumentState> = HashMap::new();
+		let params = CompletionParams {
+			text_document_position: lsp_types::TextDocumentPositionParams {
+				text_document: lsp_types::TextDocumentIdentifier {
+					uri: TEST_URI.parse().unwrap(),
+				},
+				position: Position {
+					line: 0,
+					character: 0,
+				},
+			},
+			work_done_progress_params: Default::default(),
+			partial_result_params: Default::default(),
+			context: None,
+		};
+		assert!(handle_completion(&documents, params).is_none());
 	}
 
 	// ── compute_diagnostics ──
