@@ -23,8 +23,8 @@ use lsp_types::{
 	SignatureHelpParams, SignatureInformation, TextDocumentSyncCapability, TextDocumentSyncKind,
 	TextEdit, WorkspaceEdit,
 	notification::{
-		DidChangeTextDocument, DidOpenTextDocument, DidSaveTextDocument, LogMessage,
-		Notification as _, PublishDiagnostics, ShowMessage,
+		DidChangeConfiguration, DidChangeTextDocument, DidOpenTextDocument, DidSaveTextDocument,
+		LogMessage, Notification as _, PublishDiagnostics, ShowMessage,
 	},
 	request::{
 		CodeActionRequest, Completion, DocumentSymbolRequest, Formatting, GotoDefinition,
@@ -60,7 +60,7 @@ struct InitOptions {
 	makensis: MakensisOptions,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct FormatterInitOptions {
 	#[serde(default)]
 	end_of_line: Option<String>,
@@ -103,6 +103,27 @@ impl Default for DiagnosticsOptions {
 	}
 }
 
+// Mirrors the `serde` defaults above, so an absent `formatter` key and an empty
+// one produce the same settings.
+impl Default for FormatterInitOptions {
+	fn default() -> Self {
+		Self {
+			end_of_line: None,
+			print_width: 0,
+			trim_empty_lines: true,
+			single_quote: false,
+		}
+	}
+}
+
+fn parse_end_of_line(value: Option<&str>) -> Option<EndOfLine> {
+	match value {
+		Some("crlf") => Some(EndOfLine::Crlf),
+		Some("lf") => Some(EndOfLine::Lf),
+		_ => None,
+	}
+}
+
 struct LspState {
 	makensis_path: Option<String>,
 	preprocess_mode: PreprocessMode,
@@ -111,6 +132,22 @@ struct LspState {
 	print_width: usize,
 	trim_empty_lines: bool,
 	single_quote: bool,
+}
+
+impl LspState {
+	fn from_options(options: InitOptions) -> Self {
+		Self {
+			makensis_path: compiler::find_makensis(&options.makensis.path),
+			preprocess_mode: PreprocessMode::from_option(
+				options.diagnostics.preprocess_mode.as_deref(),
+			),
+			diagnostics_on_save: options.diagnostics.enabled_on_save,
+			end_of_line: parse_end_of_line(options.formatter.end_of_line.as_deref()),
+			print_width: options.formatter.print_width,
+			trim_empty_lines: options.formatter.trim_empty_lines,
+			single_quote: options.formatter.single_quote,
+		}
+	}
 }
 
 fn main() {
@@ -155,6 +192,7 @@ fn main() {
 		Ok(params) => params,
 		Err(e) => {
 			if e.channel_is_disconnected() {
+				drop(connection);
 				io_threads.join().ok();
 			}
 			return;
@@ -166,23 +204,7 @@ fn main() {
 		.and_then(|v| serde_json::from_value(v.clone()).ok())
 		.unwrap_or_default();
 
-	let end_of_line = match options.formatter.end_of_line.as_deref() {
-		Some("crlf") => Some(EndOfLine::Crlf),
-		Some("lf") => Some(EndOfLine::Lf),
-		_ => None,
-	};
-
-	let state = LspState {
-		makensis_path: compiler::find_makensis(&options.makensis.path),
-		preprocess_mode: PreprocessMode::from_option(
-			options.diagnostics.preprocess_mode.as_deref(),
-		),
-		diagnostics_on_save: options.diagnostics.enabled_on_save,
-		end_of_line,
-		print_width: options.formatter.print_width,
-		trim_empty_lines: options.formatter.trim_empty_lines,
-		single_quote: options.formatter.single_quote,
-	};
+	let mut state = LspState::from_options(options);
 
 	log_message(
 		&connection,
@@ -215,12 +237,15 @@ fn main() {
 				handle_request(&connection, req, &documents, &state);
 			}
 			Message::Notification(not) => {
-				handle_notification(&connection, not, &mut documents, &state);
+				handle_notification(&connection, not, &mut documents, &mut state);
 			}
 			Message::Response(_) => {}
 		}
 	}
 
+	// The writer thread only finishes once every sender is gone, so the
+	// connection has to be dropped before joining or `join` blocks forever.
+	drop(connection);
 	io_threads.join().ok();
 }
 
@@ -302,9 +327,11 @@ fn handle_notification(
 	connection: &Connection,
 	not: Notification,
 	documents: &mut HashMap<String, DocumentState>,
-	state: &LspState,
+	state: &mut LspState,
 ) {
-	if let Some(params) = cast_notification::<DidOpenTextDocument>(not.clone()) {
+	if let Some(params) = cast_notification::<DidChangeConfiguration>(not.clone()) {
+		handle_configuration_change(connection, params.settings, state);
+	} else if let Some(params) = cast_notification::<DidOpenTextDocument>(not.clone()) {
 		let uri = params.text_document.uri;
 		let text = params.text_document.text;
 		publish_diagnostics(connection, uri.clone(), &text);
@@ -321,6 +348,72 @@ fn handle_notification(
 		let uri = params.text_document.uri;
 		if let Some(doc) = documents.get(&uri.to_string()) {
 			run_compiler_diagnostics(connection, state, &uri, &doc.text);
+		}
+	}
+}
+
+enum SettingsUpdate {
+	Replace(InitOptions),
+	// Clients that hold their settings server-side send `null`, which we cannot
+	// resolve without a `workspace/configuration` request.
+	Unavailable,
+	Unparseable,
+}
+
+// Settings take the same shape as `initializationOptions`, optionally wrapped in
+// an `nsis` section. They replace the previous set wholesale, so a client has to
+// send every option it cares about, not just the one that changed.
+fn parse_settings(settings: serde_json::Value) -> SettingsUpdate {
+	let settings = match settings.get("nsis") {
+		Some(section) => section.clone(),
+		None => settings,
+	};
+
+	if settings.is_null() {
+		return SettingsUpdate::Unavailable;
+	}
+
+	match serde_json::from_value(settings) {
+		Ok(options) => SettingsUpdate::Replace(options),
+		Err(_) => SettingsUpdate::Unparseable,
+	}
+}
+
+fn handle_configuration_change(
+	connection: &Connection,
+	settings: serde_json::Value,
+	state: &mut LspState,
+) {
+	let options = match parse_settings(settings) {
+		SettingsUpdate::Replace(options) => options,
+		SettingsUpdate::Unavailable => return,
+		SettingsUpdate::Unparseable => {
+			log_message(
+				connection,
+				MessageType::WARNING,
+				"Ignoring workspace/didChangeConfiguration: settings could not be parsed",
+			);
+			return;
+		}
+	};
+
+	let previous_makensis = state.makensis_path.clone();
+	*state = LspState::from_options(options);
+
+	log_message(connection, MessageType::INFO, "Configuration reloaded");
+
+	if state.makensis_path != previous_makensis {
+		match &state.makensis_path {
+			Some(path) => log_message(
+				connection,
+				MessageType::INFO,
+				&format!("Using makensis: {path}"),
+			),
+			None => log_message(
+				connection,
+				MessageType::WARNING,
+				"makensis not found — diagnostics unavailable",
+			),
 		}
 	}
 }
@@ -1586,5 +1679,117 @@ mod tests {
 			count_active_parameter("  File \"my file.exe\"", 20, "File"),
 			0
 		);
+	}
+
+	// ── parse_settings ──
+
+	use serde_json::json;
+
+	fn replaced(settings: serde_json::Value) -> InitOptions {
+		match parse_settings(settings) {
+			SettingsUpdate::Replace(options) => options,
+			_ => panic!("expected settings to be replaced"),
+		}
+	}
+
+	#[test]
+	fn settings_bare_object() {
+		let options = replaced(json!({
+			"formatter": { "print_width": 100, "single_quote": true },
+		}));
+
+		assert_eq!(options.formatter.print_width, 100);
+		assert!(options.formatter.single_quote);
+	}
+
+	#[test]
+	fn settings_nsis_section() {
+		let options = replaced(json!({
+			"nsis": { "formatter": { "print_width": 80 } },
+		}));
+
+		assert_eq!(options.formatter.print_width, 80);
+	}
+
+	#[test]
+	fn settings_omitted_options_fall_back_to_defaults() {
+		let options = replaced(json!({ "formatter": { "single_quote": true } }));
+
+		assert_eq!(options.formatter.print_width, 0);
+		assert!(options.formatter.trim_empty_lines);
+		assert_eq!(options.diagnostics.preprocess_mode.as_deref(), Some("ppo"));
+	}
+
+	#[test]
+	fn settings_empty_object_is_all_defaults() {
+		let options = replaced(json!({}));
+
+		assert!(options.formatter.trim_empty_lines);
+		assert!(options.diagnostics.enabled_on_save);
+		assert_eq!(options.makensis.path, "");
+	}
+
+	#[test]
+	fn settings_null_is_unavailable() {
+		assert!(matches!(
+			parse_settings(json!(null)),
+			SettingsUpdate::Unavailable
+		));
+	}
+
+	#[test]
+	fn settings_null_section_is_unavailable() {
+		assert!(matches!(
+			parse_settings(json!({ "nsis": null })),
+			SettingsUpdate::Unavailable
+		));
+	}
+
+	#[test]
+	fn settings_wrong_type_is_unparseable() {
+		assert!(matches!(
+			parse_settings(json!({ "formatter": { "print_width": "wide" } })),
+			SettingsUpdate::Unparseable
+		));
+	}
+
+	#[test]
+	fn settings_unknown_keys_are_ignored() {
+		let options = replaced(json!({
+			"formatter": { "printWidth": 100 },
+			"nonsense": true,
+		}));
+
+		assert_eq!(options.formatter.print_width, 0);
+	}
+
+	// ── LspState::from_options ──
+
+	#[test]
+	fn state_parses_end_of_line() {
+		assert!(matches!(parse_end_of_line(Some("lf")), Some(EndOfLine::Lf)));
+		assert!(matches!(
+			parse_end_of_line(Some("crlf")),
+			Some(EndOfLine::Crlf)
+		));
+		assert!(parse_end_of_line(Some("auto")).is_none());
+		assert!(parse_end_of_line(None).is_none());
+	}
+
+	#[test]
+	fn state_carries_formatter_options() {
+		let state = LspState::from_options(replaced(json!({
+			"formatter": {
+				"end_of_line": "crlf",
+				"print_width": 90,
+				"trim_empty_lines": false,
+				"single_quote": true,
+			},
+		})));
+
+		assert!(matches!(state.end_of_line, Some(EndOfLine::Crlf)));
+		assert_eq!(state.print_width, 90);
+		assert!(!state.trim_empty_lines);
+		assert!(state.single_quote);
 	}
 }
