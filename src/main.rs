@@ -14,12 +14,12 @@ use lsp_server::{Connection, Message, Notification, Request, RequestId, Response
 use lsp_types::{
 	CodeAction, CodeActionKind, CodeActionParams, CodeActionProviderCapability, CodeActionResponse,
 	CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
-	Diagnostic, DiagnosticSeverity, DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams,
-	DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
-	HoverParams, HoverProviderCapability, Location, LogMessageParams, MarkupContent, MarkupKind,
-	MessageType, OneOf, ParameterInformation, ParameterLabel, Position, PrepareRenameResponse,
-	PublishDiagnosticsParams, Range, ReferenceParams, RenameOptions, RenameParams,
-	ServerCapabilities, ShowMessageParams, SignatureHelp, SignatureHelpOptions,
+	CompletionTextEdit, Diagnostic, DiagnosticSeverity, DocumentFormattingParams, DocumentSymbol,
+	DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
+	Hover, HoverContents, HoverParams, HoverProviderCapability, Location, LogMessageParams,
+	MarkupContent, MarkupKind, MessageType, OneOf, ParameterInformation, ParameterLabel, Position,
+	PrepareRenameResponse, PublishDiagnosticsParams, Range, ReferenceParams, RenameOptions,
+	RenameParams, ServerCapabilities, ShowMessageParams, SignatureHelp, SignatureHelpOptions,
 	SignatureHelpParams, SignatureInformation, TextDocumentSyncCapability, TextDocumentSyncKind,
 	TextEdit, WorkspaceEdit,
 	notification::{
@@ -564,12 +564,9 @@ static CODE_ITEMS: LazyLock<Vec<CompletionItem>> = LazyLock::new(|| {
 			CompletionItemKind::FUNCTION
 		};
 
-		let (filter_text, insert_text) = trigger_prefix_texts(&entry.name);
 		items.push(CompletionItem {
 			label: entry.name.clone(),
 			kind: Some(kind),
-			filter_text,
-			insert_text,
 			detail: if entry.description.is_empty() {
 				None
 			} else {
@@ -596,16 +593,11 @@ static CODE_ITEMS: LazyLock<Vec<CompletionItem>> = LazyLock::new(|| {
 static INTERPOLATED_ITEMS: LazyLock<Vec<CompletionItem>> = LazyLock::new(|| {
 	nsis_data::BUILTIN_VARIABLES
 		.iter()
-		.map(|(var, desc)| {
-			let (filter_text, insert_text) = trigger_prefix_texts(var);
-			CompletionItem {
-				label: var.to_string(),
-				kind: Some(CompletionItemKind::VARIABLE),
-				filter_text,
-				insert_text,
-				detail: Some(desc.to_string()),
-				..Default::default()
-			}
+		.map(|(var, desc)| CompletionItem {
+			label: var.to_string(),
+			kind: Some(CompletionItemKind::VARIABLE),
+			detail: Some(desc.to_string()),
+			..Default::default()
 		})
 		.collect()
 });
@@ -618,7 +610,7 @@ fn handle_completion(
 	let pos = params.text_document_position.position;
 	let doc = documents.get(uri)?;
 
-	let items = match completion_context(&doc.text, pos) {
+	let mut items = match completion_context(&doc.text, pos) {
 		// Nothing is code inside a comment.
 		SyntaxContext::Comment => Vec::new(),
 		// Only `$VAR`, `${DEFINE}` and `$(LangString)` expand inside a string.
@@ -630,21 +622,47 @@ fn handle_completion(
 		}
 	};
 
+	// Replace the whole partial token, so `include` becomes `!include` and
+	// `INSTDIR` becomes `$INSTDIR` instead of keeping the client's word range,
+	// which would drop the sigil or double it up.
+	let line_str = doc.text.lines().nth(pos.line as usize).unwrap_or("");
+	let range = completion_range(line_str, pos);
+	for item in &mut items {
+		item.text_edit = Some(CompletionTextEdit::Edit(TextEdit {
+			range,
+			new_text: item.label.clone(),
+		}));
+	}
+
 	Some(CompletionResponse::Array(items))
+}
+
+/// Range of the partial token before the cursor, including a leading `!`, `$`
+/// or `${` the user already typed.
+fn completion_range(line_str: &str, pos: Position) -> Range {
+	let col = utf16_to_byte_offset(line_str, pos.character).min(line_str.len());
+	let bytes = line_str.as_bytes();
+
+	let mut start = col;
+	while start > 0 && is_ident_char(bytes[start - 1]) {
+		start -= 1;
+	}
+	if start > 1 && bytes[start - 1] == b'{' && bytes[start - 2] == b'$' {
+		start -= 2;
+	} else if start > 0 && (bytes[start - 1] == b'!' || bytes[start - 1] == b'$') {
+		start -= 1;
+	}
+
+	Range::new(
+		Position::new(pos.line, byte_to_utf16_offset(line_str, start)),
+		Position::new(pos.line, byte_to_utf16_offset(line_str, col)),
+	)
 }
 
 fn completion_context(text: &str, pos: Position) -> SyntaxContext {
 	let line_str = text.lines().nth(pos.line as usize).unwrap_or("");
 	let col = utf16_to_byte_offset(line_str, pos.character);
 	context::context_at(text, pos.line, col)
-}
-
-fn trigger_prefix_texts(name: &str) -> (Option<String>, Option<String>) {
-	let stripped = name.strip_prefix('!').or_else(|| name.strip_prefix('$'));
-	match stripped {
-		Some(rest) => (Some(rest.to_string()), Some(rest.to_string())),
-		None => (None, None),
-	}
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -1364,27 +1382,36 @@ mod tests {
 		assert_eq!(result, "hello…");
 	}
 
-	// ── trigger_prefix_texts ──
+	// ── completion_range ──
 
-	#[test]
-	fn trigger_prefix_bang() {
-		let (f, i) = trigger_prefix_texts("!include");
-		assert_eq!(f, Some("include".into()));
-		assert_eq!(i, Some("include".into()));
+	fn range_cols(line: &str, character: u32) -> (u32, u32) {
+		let range = completion_range(line, Position::new(0, character));
+		(range.start.character, range.end.character)
 	}
 
 	#[test]
-	fn trigger_prefix_dollar() {
-		let (f, i) = trigger_prefix_texts("$INSTDIR");
-		assert_eq!(f, Some("INSTDIR".into()));
-		assert_eq!(i, Some("INSTDIR".into()));
+	fn completion_range_bare_word() {
+		assert_eq!(range_cols("include", 7), (0, 7));
 	}
 
 	#[test]
-	fn trigger_prefix_none() {
-		let (f, i) = trigger_prefix_texts("Section");
-		assert_eq!(f, None);
-		assert_eq!(i, None);
+	fn completion_range_includes_bang() {
+		assert_eq!(range_cols("!inc", 4), (0, 4));
+	}
+
+	#[test]
+	fn completion_range_includes_dollar() {
+		assert_eq!(range_cols("StrCpy $INST", 12), (7, 12));
+	}
+
+	#[test]
+	fn completion_range_includes_dollar_brace() {
+		assert_eq!(range_cols("StrCpy $0 ${MY", 14), (10, 14));
+	}
+
+	#[test]
+	fn completion_range_empty_at_whitespace() {
+		assert_eq!(range_cols("Section ", 8), (8, 8));
 	}
 
 	// ── is_ident_char ──
@@ -1492,6 +1519,13 @@ mod tests {
 	const TEST_URI: &str = "file:///test.nsi";
 
 	fn completion_labels(text: &str, line: u32, character: u32) -> Vec<String> {
+		completion_items(text, line, character)
+			.into_iter()
+			.map(|i| i.label)
+			.collect()
+	}
+
+	fn completion_items(text: &str, line: u32, character: u32) -> Vec<CompletionItem> {
 		let mut documents = HashMap::new();
 		documents.insert(TEST_URI.to_string(), DocumentState::new(text.to_string()));
 
@@ -1508,9 +1542,62 @@ mod tests {
 		};
 
 		match handle_completion(&documents, params) {
-			Some(CompletionResponse::Array(items)) => items.into_iter().map(|i| i.label).collect(),
+			Some(CompletionResponse::Array(items)) => items,
 			other => panic!("unexpected completion response: {other:?}"),
 		}
+	}
+
+	/// The edit a client would apply when accepting `label` at this position.
+	fn completion_edit(text: &str, line: u32, character: u32, label: &str) -> TextEdit {
+		let item = completion_items(text, line, character)
+			.into_iter()
+			.find(|i| i.label == label)
+			.unwrap_or_else(|| panic!("no completion item labelled {label}"));
+
+		match item.text_edit {
+			Some(CompletionTextEdit::Edit(edit)) => edit,
+			other => panic!("unexpected text edit: {other:?}"),
+		}
+	}
+
+	#[test]
+	fn completion_edit_adds_bang_prefix() {
+		let edit = completion_edit("include", 0, 7, "!include");
+		assert_eq!(edit.new_text, "!include");
+		assert_eq!(
+			edit.range,
+			Range::new(Position::new(0, 0), Position::new(0, 7))
+		);
+	}
+
+	#[test]
+	fn completion_edit_keeps_typed_bang() {
+		let edit = completion_edit("!inc", 0, 4, "!include");
+		assert_eq!(edit.new_text, "!include");
+		assert_eq!(
+			edit.range,
+			Range::new(Position::new(0, 0), Position::new(0, 4))
+		);
+	}
+
+	#[test]
+	fn completion_edit_adds_dollar_prefix() {
+		let edit = completion_edit("StrCpy $0 INSTDIR", 0, 17, "$INSTDIR");
+		assert_eq!(edit.new_text, "$INSTDIR");
+		assert_eq!(
+			edit.range,
+			Range::new(Position::new(0, 10), Position::new(0, 17))
+		);
+	}
+
+	#[test]
+	fn completion_edit_keeps_typed_dollar() {
+		let edit = completion_edit("StrCpy $0 $INST", 0, 15, "$INSTDIR");
+		assert_eq!(edit.new_text, "$INSTDIR");
+		assert_eq!(
+			edit.range,
+			Range::new(Position::new(0, 10), Position::new(0, 15))
+		);
 	}
 
 	#[test]
