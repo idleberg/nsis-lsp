@@ -1,3 +1,4 @@
+mod cli;
 mod compiler;
 mod context;
 mod diagnostics;
@@ -8,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use ardent::{EndOfLine, Formatter, FormatterOptions};
+use clap::Parser;
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
 	CodeAction, CodeActionKind, CodeActionParams, CodeActionProviderCapability, CodeActionResponse,
@@ -31,6 +33,7 @@ use lsp_types::{
 };
 use serde::Deserialize;
 
+use cli::Cli;
 use compiler::PreprocessMode;
 use context::SyntaxContext;
 use symbols::DocumentIndex;
@@ -111,6 +114,9 @@ struct LspState {
 }
 
 fn main() {
+	// Exits on --version, --help, or an unrecognised argument.
+	Cli::parse();
+
 	let (connection, io_threads) = Connection::stdio();
 
 	let capabilities = ServerCapabilities {
