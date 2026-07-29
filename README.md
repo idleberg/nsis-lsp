@@ -62,8 +62,14 @@ The language server accepts settings via LSP `initializationOptions`:
 | ----------------------------- | ---------------- | ------- | --------------------------------------------------------------------------------------- |
 | `diagnostics.preprocess_mode` | `string \| null` | `"ppo"` | Preprocessor mode for `makensis`: `"ppo"`, `"safe_ppo"`, or `null` for full compilation |
 | `diagnostics.enabled_on_save` | `boolean`        | `true`  | Run compiler diagnostics on save                                                        |
+| `formatter.end_of_line`       | `string`         | —       | Line endings for formatted output: `"lf"` or `"crlf"`                                   |
 | `formatter.print_width`       | `number`         | `0`     | Maximum line width before breaking with `\` continuations (`0` disables wrapping)       |
+| `formatter.single_quote`      | `boolean`        | `false` | Prefer single quotes over double quotes                                                 |
+| `formatter.trim_empty_lines`  | `boolean`        | `true`  | Collapse runs of blank lines                                                            |
 | `makensis.path`               | `string`         | `""`    | Custom path to the `makensis` binary (uses `PATH` when empty)                           |
+
+Indentation is not configurable here — the formatter takes it from the `tabSize`
+and `insertSpaces` values the editor sends with each formatting request.
 
 ## License
 

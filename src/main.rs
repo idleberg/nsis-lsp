@@ -14,17 +14,17 @@ use lsp_server::{Connection, Message, Notification, Request, RequestId, Response
 use lsp_types::{
 	CodeAction, CodeActionKind, CodeActionParams, CodeActionProviderCapability, CodeActionResponse,
 	CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
-	Diagnostic, DiagnosticSeverity, DocumentFormattingParams, DocumentSymbol, DocumentSymbolParams,
-	DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
-	HoverParams, HoverProviderCapability, Location, LogMessageParams, MarkupContent, MarkupKind,
-	MessageType, OneOf, ParameterInformation, ParameterLabel, Position, PrepareRenameResponse,
-	PublishDiagnosticsParams, Range, ReferenceParams, RenameOptions, RenameParams,
-	ServerCapabilities, ShowMessageParams, SignatureHelp, SignatureHelpOptions,
+	CompletionTextEdit, Diagnostic, DiagnosticSeverity, DocumentFormattingParams, DocumentSymbol,
+	DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
+	Hover, HoverContents, HoverParams, HoverProviderCapability, Location, LogMessageParams,
+	MarkupContent, MarkupKind, MessageType, OneOf, ParameterInformation, ParameterLabel, Position,
+	PrepareRenameResponse, PublishDiagnosticsParams, Range, ReferenceParams, RenameOptions,
+	RenameParams, ServerCapabilities, ShowMessageParams, SignatureHelp, SignatureHelpOptions,
 	SignatureHelpParams, SignatureInformation, TextDocumentSyncCapability, TextDocumentSyncKind,
 	TextEdit, WorkspaceEdit,
 	notification::{
-		DidChangeTextDocument, DidOpenTextDocument, DidSaveTextDocument, LogMessage,
-		Notification as _, PublishDiagnostics, ShowMessage,
+		DidChangeConfiguration, DidChangeTextDocument, DidOpenTextDocument, DidSaveTextDocument,
+		LogMessage, Notification as _, PublishDiagnostics, ShowMessage,
 	},
 	request::{
 		CodeActionRequest, Completion, DocumentSymbolRequest, Formatting, GotoDefinition,
@@ -60,7 +60,7 @@ struct InitOptions {
 	makensis: MakensisOptions,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct FormatterInitOptions {
 	#[serde(default)]
 	end_of_line: Option<String>,
@@ -103,6 +103,27 @@ impl Default for DiagnosticsOptions {
 	}
 }
 
+// Mirrors the `serde` defaults above, so an absent `formatter` key and an empty
+// one produce the same settings.
+impl Default for FormatterInitOptions {
+	fn default() -> Self {
+		Self {
+			end_of_line: None,
+			print_width: 0,
+			trim_empty_lines: true,
+			single_quote: false,
+		}
+	}
+}
+
+fn parse_end_of_line(value: Option<&str>) -> Option<EndOfLine> {
+	match value {
+		Some("crlf") => Some(EndOfLine::Crlf),
+		Some("lf") => Some(EndOfLine::Lf),
+		_ => None,
+	}
+}
+
 struct LspState {
 	makensis_path: Option<String>,
 	preprocess_mode: PreprocessMode,
@@ -111,6 +132,22 @@ struct LspState {
 	print_width: usize,
 	trim_empty_lines: bool,
 	single_quote: bool,
+}
+
+impl LspState {
+	fn from_options(options: InitOptions) -> Self {
+		Self {
+			makensis_path: compiler::find_makensis(&options.makensis.path),
+			preprocess_mode: PreprocessMode::from_option(
+				options.diagnostics.preprocess_mode.as_deref(),
+			),
+			diagnostics_on_save: options.diagnostics.enabled_on_save,
+			end_of_line: parse_end_of_line(options.formatter.end_of_line.as_deref()),
+			print_width: options.formatter.print_width,
+			trim_empty_lines: options.formatter.trim_empty_lines,
+			single_quote: options.formatter.single_quote,
+		}
+	}
 }
 
 fn main() {
@@ -155,6 +192,7 @@ fn main() {
 		Ok(params) => params,
 		Err(e) => {
 			if e.channel_is_disconnected() {
+				drop(connection);
 				io_threads.join().ok();
 			}
 			return;
@@ -166,23 +204,7 @@ fn main() {
 		.and_then(|v| serde_json::from_value(v.clone()).ok())
 		.unwrap_or_default();
 
-	let end_of_line = match options.formatter.end_of_line.as_deref() {
-		Some("crlf") => Some(EndOfLine::Crlf),
-		Some("lf") => Some(EndOfLine::Lf),
-		_ => None,
-	};
-
-	let state = LspState {
-		makensis_path: compiler::find_makensis(&options.makensis.path),
-		preprocess_mode: PreprocessMode::from_option(
-			options.diagnostics.preprocess_mode.as_deref(),
-		),
-		diagnostics_on_save: options.diagnostics.enabled_on_save,
-		end_of_line,
-		print_width: options.formatter.print_width,
-		trim_empty_lines: options.formatter.trim_empty_lines,
-		single_quote: options.formatter.single_quote,
-	};
+	let mut state = LspState::from_options(options);
 
 	log_message(
 		&connection,
@@ -215,12 +237,15 @@ fn main() {
 				handle_request(&connection, req, &documents, &state);
 			}
 			Message::Notification(not) => {
-				handle_notification(&connection, not, &mut documents, &state);
+				handle_notification(&connection, not, &mut documents, &mut state);
 			}
 			Message::Response(_) => {}
 		}
 	}
 
+	// The writer thread only finishes once every sender is gone, so the
+	// connection has to be dropped before joining or `join` blocks forever.
+	drop(connection);
 	io_threads.join().ok();
 }
 
@@ -302,9 +327,11 @@ fn handle_notification(
 	connection: &Connection,
 	not: Notification,
 	documents: &mut HashMap<String, DocumentState>,
-	state: &LspState,
+	state: &mut LspState,
 ) {
-	if let Some(params) = cast_notification::<DidOpenTextDocument>(not.clone()) {
+	if let Some(params) = cast_notification::<DidChangeConfiguration>(not.clone()) {
+		handle_configuration_change(connection, params.settings, state);
+	} else if let Some(params) = cast_notification::<DidOpenTextDocument>(not.clone()) {
 		let uri = params.text_document.uri;
 		let text = params.text_document.text;
 		publish_diagnostics(connection, uri.clone(), &text);
@@ -321,6 +348,72 @@ fn handle_notification(
 		let uri = params.text_document.uri;
 		if let Some(doc) = documents.get(&uri.to_string()) {
 			run_compiler_diagnostics(connection, state, &uri, &doc.text);
+		}
+	}
+}
+
+enum SettingsUpdate {
+	Replace(InitOptions),
+	// Clients that hold their settings server-side send `null`, which we cannot
+	// resolve without a `workspace/configuration` request.
+	Unavailable,
+	Unparseable,
+}
+
+// Settings take the same shape as `initializationOptions`, optionally wrapped in
+// an `nsis` section. They replace the previous set wholesale, so a client has to
+// send every option it cares about, not just the one that changed.
+fn parse_settings(settings: serde_json::Value) -> SettingsUpdate {
+	let settings = match settings.get("nsis") {
+		Some(section) => section.clone(),
+		None => settings,
+	};
+
+	if settings.is_null() {
+		return SettingsUpdate::Unavailable;
+	}
+
+	match serde_json::from_value(settings) {
+		Ok(options) => SettingsUpdate::Replace(options),
+		Err(_) => SettingsUpdate::Unparseable,
+	}
+}
+
+fn handle_configuration_change(
+	connection: &Connection,
+	settings: serde_json::Value,
+	state: &mut LspState,
+) {
+	let options = match parse_settings(settings) {
+		SettingsUpdate::Replace(options) => options,
+		SettingsUpdate::Unavailable => return,
+		SettingsUpdate::Unparseable => {
+			log_message(
+				connection,
+				MessageType::WARNING,
+				"Ignoring workspace/didChangeConfiguration: settings could not be parsed",
+			);
+			return;
+		}
+	};
+
+	let previous_makensis = state.makensis_path.clone();
+	*state = LspState::from_options(options);
+
+	log_message(connection, MessageType::INFO, "Configuration reloaded");
+
+	if state.makensis_path != previous_makensis {
+		match &state.makensis_path {
+			Some(path) => log_message(
+				connection,
+				MessageType::INFO,
+				&format!("Using makensis: {path}"),
+			),
+			None => log_message(
+				connection,
+				MessageType::WARNING,
+				"makensis not found — diagnostics unavailable",
+			),
 		}
 	}
 }
@@ -471,12 +564,9 @@ static CODE_ITEMS: LazyLock<Vec<CompletionItem>> = LazyLock::new(|| {
 			CompletionItemKind::FUNCTION
 		};
 
-		let (filter_text, insert_text) = trigger_prefix_texts(&entry.name);
 		items.push(CompletionItem {
 			label: entry.name.clone(),
 			kind: Some(kind),
-			filter_text,
-			insert_text,
 			detail: if entry.description.is_empty() {
 				None
 			} else {
@@ -503,16 +593,11 @@ static CODE_ITEMS: LazyLock<Vec<CompletionItem>> = LazyLock::new(|| {
 static INTERPOLATED_ITEMS: LazyLock<Vec<CompletionItem>> = LazyLock::new(|| {
 	nsis_data::BUILTIN_VARIABLES
 		.iter()
-		.map(|(var, desc)| {
-			let (filter_text, insert_text) = trigger_prefix_texts(var);
-			CompletionItem {
-				label: var.to_string(),
-				kind: Some(CompletionItemKind::VARIABLE),
-				filter_text,
-				insert_text,
-				detail: Some(desc.to_string()),
-				..Default::default()
-			}
+		.map(|(var, desc)| CompletionItem {
+			label: var.to_string(),
+			kind: Some(CompletionItemKind::VARIABLE),
+			detail: Some(desc.to_string()),
+			..Default::default()
 		})
 		.collect()
 });
@@ -525,7 +610,7 @@ fn handle_completion(
 	let pos = params.text_document_position.position;
 	let doc = documents.get(uri)?;
 
-	let items = match completion_context(&doc.text, pos) {
+	let mut items = match completion_context(&doc.text, pos) {
 		// Nothing is code inside a comment.
 		SyntaxContext::Comment => Vec::new(),
 		// Only `$VAR`, `${DEFINE}` and `$(LangString)` expand inside a string.
@@ -537,21 +622,47 @@ fn handle_completion(
 		}
 	};
 
+	// Replace the whole partial token, so `include` becomes `!include` and
+	// `INSTDIR` becomes `$INSTDIR` instead of keeping the client's word range,
+	// which would drop the sigil or double it up.
+	let line_str = doc.text.lines().nth(pos.line as usize).unwrap_or("");
+	let range = completion_range(line_str, pos);
+	for item in &mut items {
+		item.text_edit = Some(CompletionTextEdit::Edit(TextEdit {
+			range,
+			new_text: item.label.clone(),
+		}));
+	}
+
 	Some(CompletionResponse::Array(items))
+}
+
+/// Range of the partial token before the cursor, including a leading `!`, `$`
+/// or `${` the user already typed.
+fn completion_range(line_str: &str, pos: Position) -> Range {
+	let col = utf16_to_byte_offset(line_str, pos.character).min(line_str.len());
+	let bytes = line_str.as_bytes();
+
+	let mut start = col;
+	while start > 0 && is_ident_char(bytes[start - 1]) {
+		start -= 1;
+	}
+	if start > 1 && bytes[start - 1] == b'{' && bytes[start - 2] == b'$' {
+		start -= 2;
+	} else if start > 0 && (bytes[start - 1] == b'!' || bytes[start - 1] == b'$') {
+		start -= 1;
+	}
+
+	Range::new(
+		Position::new(pos.line, byte_to_utf16_offset(line_str, start)),
+		Position::new(pos.line, byte_to_utf16_offset(line_str, col)),
+	)
 }
 
 fn completion_context(text: &str, pos: Position) -> SyntaxContext {
 	let line_str = text.lines().nth(pos.line as usize).unwrap_or("");
 	let col = utf16_to_byte_offset(line_str, pos.character);
 	context::context_at(text, pos.line, col)
-}
-
-fn trigger_prefix_texts(name: &str) -> (Option<String>, Option<String>) {
-	let stripped = name.strip_prefix('!').or_else(|| name.strip_prefix('$'));
-	match stripped {
-		Some(rest) => (Some(rest.to_string()), Some(rest.to_string())),
-		None => (None, None),
-	}
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -1271,27 +1382,36 @@ mod tests {
 		assert_eq!(result, "hello…");
 	}
 
-	// ── trigger_prefix_texts ──
+	// ── completion_range ──
 
-	#[test]
-	fn trigger_prefix_bang() {
-		let (f, i) = trigger_prefix_texts("!include");
-		assert_eq!(f, Some("include".into()));
-		assert_eq!(i, Some("include".into()));
+	fn range_cols(line: &str, character: u32) -> (u32, u32) {
+		let range = completion_range(line, Position::new(0, character));
+		(range.start.character, range.end.character)
 	}
 
 	#[test]
-	fn trigger_prefix_dollar() {
-		let (f, i) = trigger_prefix_texts("$INSTDIR");
-		assert_eq!(f, Some("INSTDIR".into()));
-		assert_eq!(i, Some("INSTDIR".into()));
+	fn completion_range_bare_word() {
+		assert_eq!(range_cols("include", 7), (0, 7));
 	}
 
 	#[test]
-	fn trigger_prefix_none() {
-		let (f, i) = trigger_prefix_texts("Section");
-		assert_eq!(f, None);
-		assert_eq!(i, None);
+	fn completion_range_includes_bang() {
+		assert_eq!(range_cols("!inc", 4), (0, 4));
+	}
+
+	#[test]
+	fn completion_range_includes_dollar() {
+		assert_eq!(range_cols("StrCpy $INST", 12), (7, 12));
+	}
+
+	#[test]
+	fn completion_range_includes_dollar_brace() {
+		assert_eq!(range_cols("StrCpy $0 ${MY", 14), (10, 14));
+	}
+
+	#[test]
+	fn completion_range_empty_at_whitespace() {
+		assert_eq!(range_cols("Section ", 8), (8, 8));
 	}
 
 	// ── is_ident_char ──
@@ -1399,6 +1519,13 @@ mod tests {
 	const TEST_URI: &str = "file:///test.nsi";
 
 	fn completion_labels(text: &str, line: u32, character: u32) -> Vec<String> {
+		completion_items(text, line, character)
+			.into_iter()
+			.map(|i| i.label)
+			.collect()
+	}
+
+	fn completion_items(text: &str, line: u32, character: u32) -> Vec<CompletionItem> {
 		let mut documents = HashMap::new();
 		documents.insert(TEST_URI.to_string(), DocumentState::new(text.to_string()));
 
@@ -1415,9 +1542,62 @@ mod tests {
 		};
 
 		match handle_completion(&documents, params) {
-			Some(CompletionResponse::Array(items)) => items.into_iter().map(|i| i.label).collect(),
+			Some(CompletionResponse::Array(items)) => items,
 			other => panic!("unexpected completion response: {other:?}"),
 		}
+	}
+
+	/// The edit a client would apply when accepting `label` at this position.
+	fn completion_edit(text: &str, line: u32, character: u32, label: &str) -> TextEdit {
+		let item = completion_items(text, line, character)
+			.into_iter()
+			.find(|i| i.label == label)
+			.unwrap_or_else(|| panic!("no completion item labelled {label}"));
+
+		match item.text_edit {
+			Some(CompletionTextEdit::Edit(edit)) => edit,
+			other => panic!("unexpected text edit: {other:?}"),
+		}
+	}
+
+	#[test]
+	fn completion_edit_adds_bang_prefix() {
+		let edit = completion_edit("include", 0, 7, "!include");
+		assert_eq!(edit.new_text, "!include");
+		assert_eq!(
+			edit.range,
+			Range::new(Position::new(0, 0), Position::new(0, 7))
+		);
+	}
+
+	#[test]
+	fn completion_edit_keeps_typed_bang() {
+		let edit = completion_edit("!inc", 0, 4, "!include");
+		assert_eq!(edit.new_text, "!include");
+		assert_eq!(
+			edit.range,
+			Range::new(Position::new(0, 0), Position::new(0, 4))
+		);
+	}
+
+	#[test]
+	fn completion_edit_adds_dollar_prefix() {
+		let edit = completion_edit("StrCpy $0 INSTDIR", 0, 17, "$INSTDIR");
+		assert_eq!(edit.new_text, "$INSTDIR");
+		assert_eq!(
+			edit.range,
+			Range::new(Position::new(0, 10), Position::new(0, 17))
+		);
+	}
+
+	#[test]
+	fn completion_edit_keeps_typed_dollar() {
+		let edit = completion_edit("StrCpy $0 $INST", 0, 15, "$INSTDIR");
+		assert_eq!(edit.new_text, "$INSTDIR");
+		assert_eq!(
+			edit.range,
+			Range::new(Position::new(0, 10), Position::new(0, 15))
+		);
 	}
 
 	#[test]
@@ -1586,5 +1766,117 @@ mod tests {
 			count_active_parameter("  File \"my file.exe\"", 20, "File"),
 			0
 		);
+	}
+
+	// ── parse_settings ──
+
+	use serde_json::json;
+
+	fn replaced(settings: serde_json::Value) -> InitOptions {
+		match parse_settings(settings) {
+			SettingsUpdate::Replace(options) => options,
+			_ => panic!("expected settings to be replaced"),
+		}
+	}
+
+	#[test]
+	fn settings_bare_object() {
+		let options = replaced(json!({
+			"formatter": { "print_width": 100, "single_quote": true },
+		}));
+
+		assert_eq!(options.formatter.print_width, 100);
+		assert!(options.formatter.single_quote);
+	}
+
+	#[test]
+	fn settings_nsis_section() {
+		let options = replaced(json!({
+			"nsis": { "formatter": { "print_width": 80 } },
+		}));
+
+		assert_eq!(options.formatter.print_width, 80);
+	}
+
+	#[test]
+	fn settings_omitted_options_fall_back_to_defaults() {
+		let options = replaced(json!({ "formatter": { "single_quote": true } }));
+
+		assert_eq!(options.formatter.print_width, 0);
+		assert!(options.formatter.trim_empty_lines);
+		assert_eq!(options.diagnostics.preprocess_mode.as_deref(), Some("ppo"));
+	}
+
+	#[test]
+	fn settings_empty_object_is_all_defaults() {
+		let options = replaced(json!({}));
+
+		assert!(options.formatter.trim_empty_lines);
+		assert!(options.diagnostics.enabled_on_save);
+		assert_eq!(options.makensis.path, "");
+	}
+
+	#[test]
+	fn settings_null_is_unavailable() {
+		assert!(matches!(
+			parse_settings(json!(null)),
+			SettingsUpdate::Unavailable
+		));
+	}
+
+	#[test]
+	fn settings_null_section_is_unavailable() {
+		assert!(matches!(
+			parse_settings(json!({ "nsis": null })),
+			SettingsUpdate::Unavailable
+		));
+	}
+
+	#[test]
+	fn settings_wrong_type_is_unparseable() {
+		assert!(matches!(
+			parse_settings(json!({ "formatter": { "print_width": "wide" } })),
+			SettingsUpdate::Unparseable
+		));
+	}
+
+	#[test]
+	fn settings_unknown_keys_are_ignored() {
+		let options = replaced(json!({
+			"formatter": { "printWidth": 100 },
+			"nonsense": true,
+		}));
+
+		assert_eq!(options.formatter.print_width, 0);
+	}
+
+	// ── LspState::from_options ──
+
+	#[test]
+	fn state_parses_end_of_line() {
+		assert!(matches!(parse_end_of_line(Some("lf")), Some(EndOfLine::Lf)));
+		assert!(matches!(
+			parse_end_of_line(Some("crlf")),
+			Some(EndOfLine::Crlf)
+		));
+		assert!(parse_end_of_line(Some("auto")).is_none());
+		assert!(parse_end_of_line(None).is_none());
+	}
+
+	#[test]
+	fn state_carries_formatter_options() {
+		let state = LspState::from_options(replaced(json!({
+			"formatter": {
+				"end_of_line": "crlf",
+				"print_width": 90,
+				"trim_empty_lines": false,
+				"single_quote": true,
+			},
+		})));
+
+		assert!(matches!(state.end_of_line, Some(EndOfLine::Crlf)));
+		assert_eq!(state.print_width, 90);
+		assert!(!state.trim_empty_lines);
+		assert!(state.single_quote);
 	}
 }
