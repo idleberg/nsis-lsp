@@ -35,8 +35,60 @@ pub struct SymbolDef {
 	pub children: Vec<SymbolDef>,
 }
 
+/// Every definition in one document.
+///
+/// The symbols are nested two deep — containers (`Function`, `Section`,
+/// `!macro`) hold the labels declared inside them — because `documentSymbol`
+/// wants that shape. Every other caller wants to look a name up, so the `Vec`
+/// stays private and the lookups live here, with one matching rule instead of
+/// one per call site.
 pub struct DocumentIndex {
-	pub symbols: Vec<SymbolDef>,
+	symbols: Vec<SymbolDef>,
+}
+
+impl DocumentIndex {
+	/// The top-level definitions, each still carrying its children. Only
+	/// `documentSymbol`, which reports the tree as it stands, needs this.
+	pub fn roots(&self) -> &[SymbolDef] {
+		&self.symbols
+	}
+
+	/// Every definition, container and child alike, each container ahead of the
+	/// labels inside it.
+	fn all(&self) -> impl Iterator<Item = &SymbolDef> {
+		self.symbols
+			.iter()
+			.flat_map(|sym| std::iter::once(sym).chain(sym.children.iter()))
+	}
+
+	/// The definition of `word`, or `None` if the document defines nothing by
+	/// that name.
+	///
+	/// Case is ignored, and so is a leading `$` or `!`: the user points at
+	/// `$myVar` or `!MyMacro`, but the definition is recorded under the bare
+	/// name.
+	pub fn definition(&self, word: &str) -> Option<&SymbolDef> {
+		let bare = strip_sigils(word);
+		self.all()
+			.find(|sym| sym.name.eq_ignore_ascii_case(bare) || sym.name.eq_ignore_ascii_case(word))
+	}
+
+	/// Every definition of `name` as a `kind`. A rename has to rewrite all of
+	/// them — the same label name may be declared in more than one function.
+	pub fn definitions_of(
+		&self,
+		name: &str,
+		kind: NsisSymbolKind,
+	) -> impl Iterator<Item = &SymbolDef> {
+		let bare = strip_sigils(name);
+		self.all()
+			.filter(move |sym| sym.kind == kind && sym.name.eq_ignore_ascii_case(bare))
+	}
+}
+
+/// The bare identifier, without the `$` or `!` a caller may have written.
+fn strip_sigils(word: &str) -> &str {
+	word.trim_start_matches('$').trim_start_matches('!')
 }
 
 pub fn index_document(text: &str) -> DocumentIndex {
@@ -311,21 +363,6 @@ fn line_end_position(line_num: u32, line: &str, code: &str) -> Position {
 	Position::new(line_num, byte_to_utf16_offset(line, code.trim_end().len()))
 }
 
-pub fn find_symbol_kind(index: &DocumentIndex, word: &str) -> Option<NsisSymbolKind> {
-	let bare = word.trim_start_matches('$').trim_start_matches('!');
-	for sym in &index.symbols {
-		if sym.name.eq_ignore_ascii_case(bare) || sym.name.eq_ignore_ascii_case(word) {
-			return Some(sym.kind);
-		}
-		for child in &sym.children {
-			if child.name.eq_ignore_ascii_case(bare) || child.name.eq_ignore_ascii_case(word) {
-				return Some(child.kind);
-			}
-		}
-	}
-	None
-}
-
 pub fn find_references(text: &str, name: &str, kind: NsisSymbolKind) -> Vec<Range> {
 	let mut refs = Vec::new();
 	let mut scan = CodeScan::new();
@@ -500,108 +537,108 @@ mod tests {
 	fn index_function_with_labels() {
 		let text = "Function myFunc\n  label1:\n  label2:\nFunctionEnd";
 		let idx = index_document(text);
-		assert_eq!(idx.symbols.len(), 1);
-		assert_eq!(idx.symbols[0].name, "myFunc");
-		assert_eq!(idx.symbols[0].kind, NsisSymbolKind::Function);
-		assert_eq!(idx.symbols[0].children.len(), 2);
-		assert_eq!(idx.symbols[0].children[0].name, "label1");
-		assert_eq!(idx.symbols[0].children[0].kind, NsisSymbolKind::Label);
-		assert_eq!(idx.symbols[0].children[1].name, "label2");
+		assert_eq!(idx.roots().len(), 1);
+		assert_eq!(idx.roots()[0].name, "myFunc");
+		assert_eq!(idx.roots()[0].kind, NsisSymbolKind::Function);
+		assert_eq!(idx.roots()[0].children.len(), 2);
+		assert_eq!(idx.roots()[0].children[0].name, "label1");
+		assert_eq!(idx.roots()[0].children[0].kind, NsisSymbolKind::Label);
+		assert_eq!(idx.roots()[0].children[1].name, "label2");
 	}
 
 	#[test]
 	fn index_macro() {
 		let text = "!macro MyMacro arg1 arg2\n  DetailPrint hello\n!macroend";
 		let idx = index_document(text);
-		assert_eq!(idx.symbols.len(), 1);
-		assert_eq!(idx.symbols[0].name, "MyMacro");
-		assert_eq!(idx.symbols[0].kind, NsisSymbolKind::Macro);
+		assert_eq!(idx.roots().len(), 1);
+		assert_eq!(idx.roots()[0].name, "MyMacro");
+		assert_eq!(idx.roots()[0].kind, NsisSymbolKind::Macro);
 	}
 
 	#[test]
 	fn index_section_with_display_name() {
 		let text = "Section \"Install Files\" sec_install\n  File app.exe\nSectionEnd";
 		let idx = index_document(text);
-		assert_eq!(idx.symbols.len(), 1);
-		assert_eq!(idx.symbols[0].name, "Install Files");
-		assert_eq!(idx.symbols[0].kind, NsisSymbolKind::Section);
+		assert_eq!(idx.roots().len(), 1);
+		assert_eq!(idx.roots()[0].name, "Install Files");
+		assert_eq!(idx.roots()[0].kind, NsisSymbolKind::Section);
 	}
 
 	#[test]
 	fn index_section_unquoted() {
 		let text = "Section main\nSectionEnd";
 		let idx = index_document(text);
-		assert_eq!(idx.symbols.len(), 1);
-		assert_eq!(idx.symbols[0].name, "main");
+		assert_eq!(idx.roots().len(), 1);
+		assert_eq!(idx.roots()[0].name, "main");
 	}
 
 	#[test]
 	fn index_section_with_flag() {
 		let text = "Section /e \"Optional\" sec_opt\nSectionEnd";
 		let idx = index_document(text);
-		assert_eq!(idx.symbols.len(), 1);
+		assert_eq!(idx.roots().len(), 1);
 		// /e flag should be handled, extracting the name after the flag
-		assert!(!idx.symbols[0].name.starts_with('/'));
+		assert!(!idx.roots()[0].name.starts_with('/'));
 	}
 
 	#[test]
 	fn index_variable() {
 		let text = "Var myVar\nVar /GLOBAL otherVar";
 		let idx = index_document(text);
-		assert_eq!(idx.symbols.len(), 2);
-		assert_eq!(idx.symbols[0].name, "myVar");
-		assert_eq!(idx.symbols[0].kind, NsisSymbolKind::Variable);
-		assert_eq!(idx.symbols[1].name, "otherVar");
+		assert_eq!(idx.roots().len(), 2);
+		assert_eq!(idx.roots()[0].name, "myVar");
+		assert_eq!(idx.roots()[0].kind, NsisSymbolKind::Variable);
+		assert_eq!(idx.roots()[1].name, "otherVar");
 	}
 
 	#[test]
 	fn index_define() {
 		let text = "!define APP_NAME \"MyApp\"\n!define VERSION 1.0";
 		let idx = index_document(text);
-		assert_eq!(idx.symbols.len(), 2);
-		assert_eq!(idx.symbols[0].name, "APP_NAME");
-		assert_eq!(idx.symbols[0].kind, NsisSymbolKind::Define);
-		assert_eq!(idx.symbols[1].name, "VERSION");
+		assert_eq!(idx.roots().len(), 2);
+		assert_eq!(idx.roots()[0].name, "APP_NAME");
+		assert_eq!(idx.roots()[0].kind, NsisSymbolKind::Define);
+		assert_eq!(idx.roots()[1].name, "VERSION");
 	}
 
 	#[test]
 	fn index_standalone_label() {
 		let text = "start:\n  DetailPrint hello";
 		let idx = index_document(text);
-		assert_eq!(idx.symbols.len(), 1);
-		assert_eq!(idx.symbols[0].name, "start");
-		assert_eq!(idx.symbols[0].kind, NsisSymbolKind::Label);
+		assert_eq!(idx.roots().len(), 1);
+		assert_eq!(idx.roots()[0].name, "start");
+		assert_eq!(idx.roots()[0].kind, NsisSymbolKind::Label);
 	}
 
 	#[test]
 	fn index_empty_file() {
 		let idx = index_document("");
-		assert!(idx.symbols.is_empty());
+		assert!(idx.roots().is_empty());
 	}
 
 	#[test]
 	fn index_skips_comments() {
 		let text = "# Function fake\n; Var notReal\nFunction real\nFunctionEnd";
 		let idx = index_document(text);
-		assert_eq!(idx.symbols.len(), 1);
-		assert_eq!(idx.symbols[0].name, "real");
+		assert_eq!(idx.roots().len(), 1);
+		assert_eq!(idx.roots()[0].name, "real");
 	}
 
 	#[test]
 	fn index_skips_block_comments() {
 		let text = "/* Function fake\nVar notReal */\nFunction real\nFunctionEnd";
 		let idx = index_document(text);
-		assert_eq!(idx.symbols.len(), 1);
-		assert_eq!(idx.symbols[0].name, "real");
+		assert_eq!(idx.roots().len(), 1);
+		assert_eq!(idx.roots()[0].name, "real");
 	}
 
 	#[test]
 	fn index_callback_function() {
 		let text = "Function .onInit\n  Abort\nFunctionEnd";
 		let idx = index_document(text);
-		assert_eq!(idx.symbols.len(), 1);
-		assert_eq!(idx.symbols[0].name, ".onInit");
-		assert_eq!(idx.symbols[0].kind, NsisSymbolKind::Function);
+		assert_eq!(idx.roots().len(), 1);
+		assert_eq!(idx.roots()[0].name, ".onInit");
+		assert_eq!(idx.roots()[0].kind, NsisSymbolKind::Function);
 	}
 
 	#[test]
@@ -621,37 +658,37 @@ SectionEnd
 !macro Helper
 !macroend";
 		let idx = index_document(text);
-		let names: Vec<&str> = idx.symbols.iter().map(|s| s.name.as_str()).collect();
+		let names: Vec<&str> = idx.roots().iter().map(|s| s.name.as_str()).collect();
 		assert_eq!(
 			names,
 			vec!["APP_NAME", "myVar", ".onInit", "Files", "Helper"]
 		);
-		assert_eq!(idx.symbols[2].children.len(), 1);
-		assert_eq!(idx.symbols[2].children[0].name, "start");
+		assert_eq!(idx.roots()[2].children.len(), 1);
+		assert_eq!(idx.roots()[2].children[0].name, "start");
 	}
 
 	#[test]
 	fn index_unclosed_function() {
 		let text = "Function unclosed\n  label1:";
 		let idx = index_document(text);
-		assert_eq!(idx.symbols.len(), 1);
-		assert_eq!(idx.symbols[0].name, "unclosed");
-		assert_eq!(idx.symbols[0].children.len(), 1);
+		assert_eq!(idx.roots().len(), 1);
+		assert_eq!(idx.roots()[0].name, "unclosed");
+		assert_eq!(idx.roots()[0].children.len(), 1);
 	}
 
 	#[test]
 	fn index_section_flag_e() {
 		let text = "Section /e \"Optional Section\"\nSectionEnd";
 		let idx = index_document(text);
-		assert_eq!(idx.symbols.len(), 1);
-		assert_eq!(idx.symbols[0].name, "Optional Section");
+		assert_eq!(idx.roots().len(), 1);
+		assert_eq!(idx.roots()[0].name, "Optional Section");
 	}
 
 	#[test]
 	fn selection_range_covers_name_only() {
 		let text = "Function myFunc\nFunctionEnd";
 		let idx = index_document(text);
-		let sel = idx.symbols[0].selection_range;
+		let sel = idx.roots()[0].selection_range;
 		assert_eq!(sel.start.character, 9); // "Function " = 9 chars
 		assert_eq!(sel.end.character, 15); // "myFunc" = 6 chars
 	}
@@ -660,7 +697,7 @@ SectionEnd
 	fn define_skips_flags() {
 		let text = "!define /date NOW";
 		let idx = index_document(text);
-		assert!(idx.symbols.is_empty() || idx.symbols[0].name != "/date");
+		assert!(idx.roots().is_empty() || idx.roots()[0].name != "/date");
 	}
 
 	#[test]
@@ -683,35 +720,72 @@ SectionEnd
 		assert_eq!(name, "Expanded");
 	}
 
-	// ── find_symbol_kind ──
+	// ── Looking a definition up ──
 
-	#[test]
-	fn find_symbol_kind_function() {
-		let idx = index_document("Function myFunc\nFunctionEnd");
-		assert_eq!(
-			find_symbol_kind(&idx, "myFunc"),
-			Some(NsisSymbolKind::Function)
-		);
+	/// The kind of the definition of `word`, for tests that only care about
+	/// which kind answered.
+	fn kind_of(idx: &DocumentIndex, word: &str) -> Option<NsisSymbolKind> {
+		idx.definition(word).map(|sym| sym.kind)
 	}
 
 	#[test]
-	fn find_symbol_kind_child_label() {
+	fn definition_of_a_function() {
+		let idx = index_document("Function myFunc\nFunctionEnd");
+		assert_eq!(kind_of(&idx, "myFunc"), Some(NsisSymbolKind::Function));
+	}
+
+	/// A label lives inside its container, but a lookup does not have to know
+	/// that.
+	#[test]
+	fn definition_of_a_nested_label() {
 		let idx = index_document("Function myFunc\n  start:\nFunctionEnd");
-		assert_eq!(find_symbol_kind(&idx, "start"), Some(NsisSymbolKind::Label));
+		assert_eq!(kind_of(&idx, "start"), Some(NsisSymbolKind::Label));
 	}
 
 	#[test]
-	fn find_symbol_kind_not_found() {
+	fn definition_of_an_undefined_name() {
 		let idx = index_document("Function myFunc\nFunctionEnd");
-		assert_eq!(find_symbol_kind(&idx, "missing"), None);
+		assert!(idx.definition("missing").is_none());
+	}
+
+	/// The user points at the sigil the name is *used* with; the definition is
+	/// recorded bare.
+	#[test]
+	fn definition_is_found_through_a_sigil() {
+		let idx = index_document("Var myVar");
+		assert_eq!(kind_of(&idx, "$myVar"), Some(NsisSymbolKind::Variable));
+		assert_eq!(kind_of(&idx, "myVar"), Some(NsisSymbolKind::Variable));
+
+		let idx = index_document("!macro MyMacro\n!macroend");
+		assert_eq!(kind_of(&idx, "!MyMacro"), Some(NsisSymbolKind::Macro));
 	}
 
 	#[test]
-	fn find_symbol_kind_with_dollar_prefix() {
-		let idx = index_document("Var myVar");
+	fn definition_ignores_case() {
+		let idx = index_document("Function myFunc\nFunctionEnd");
+		assert_eq!(idx.definition("MYFUNC").unwrap().name, "myFunc");
+	}
+
+	/// The same label name may be declared in more than one function, and a
+	/// rename has to rewrite every one of them.
+	#[test]
+	fn definitions_of_finds_every_declaration_of_a_kind() {
+		let idx =
+			index_document("Function a\n  done:\nFunctionEnd\nFunction b\n  done:\nFunctionEnd");
+		assert_eq!(idx.definitions_of("done", NsisSymbolKind::Label).count(), 2);
+	}
+
+	#[test]
+	fn definitions_of_is_filtered_by_kind() {
+		let idx = index_document("Var thing\n!define thing 1");
 		assert_eq!(
-			find_symbol_kind(&idx, "$myVar"),
-			Some(NsisSymbolKind::Variable)
+			idx.definitions_of("thing", NsisSymbolKind::Variable)
+				.count(),
+			1
+		);
+		assert_eq!(
+			idx.definitions_of("thing", NsisSymbolKind::Define).count(),
+			1
 		);
 	}
 

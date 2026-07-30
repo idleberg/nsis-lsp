@@ -197,7 +197,7 @@ mod tests {
 		workspace.open(uri(URI), "Function myFunc\nFunctionEnd".to_string());
 
 		let doc = workspace.document(&uri(URI)).unwrap();
-		assert_eq!(doc.index.symbols.len(), 1);
+		assert_eq!(doc.index.roots().len(), 1);
 		assert_eq!(doc.uri, uri(URI));
 	}
 
@@ -209,7 +209,7 @@ mod tests {
 
 		assert_eq!(workspace.documents().count(), 1);
 		let doc = workspace.document(&uri(URI)).unwrap();
-		assert_eq!(doc.index.symbols[0].name, "new");
+		assert_eq!(doc.index.roots()[0].name, "new");
 	}
 
 	#[test]

@@ -694,23 +694,11 @@ fn find_symbol_location(
 	index: &DocumentIndex,
 	word: &str,
 ) -> Option<GotoDefinitionResponse> {
-	for sym in &index.symbols {
-		if sym.name.eq_ignore_ascii_case(word) {
-			return Some(GotoDefinitionResponse::Scalar(Location {
-				uri: uri.clone(),
-				range: sym.selection_range,
-			}));
-		}
-		for child in &sym.children {
-			if child.name.eq_ignore_ascii_case(word) {
-				return Some(GotoDefinitionResponse::Scalar(Location {
-					uri: uri.clone(),
-					range: child.selection_range,
-				}));
-			}
-		}
-	}
-	None
+	let sym = index.definition(word)?;
+	Some(GotoDefinitionResponse::Scalar(Location {
+		uri: uri.clone(),
+		range: sym.selection_range,
+	}))
 }
 
 // ── Document Symbols ──
@@ -722,7 +710,7 @@ fn handle_document_symbols(
 	let doc = workspace.document(&params.text_document.uri)?;
 	let symbols = doc
 		.index
-		.symbols
+		.roots()
 		.iter()
 		.map(symbol_def_to_document_symbol)
 		.collect();
@@ -768,7 +756,7 @@ fn handle_references(workspace: &Workspace, params: ReferenceParams) -> Option<V
 	let at = &params.text_document_position;
 	let (doc, word) = workspace.word_at(&at.text_document.uri, at.position)?;
 	let bare = word.trim_start_matches('$').trim_start_matches('!');
-	let kind = symbols::find_symbol_kind(&doc.index, &word)?;
+	let kind = doc.index.definition(&word)?.kind;
 
 	let mut locations = Vec::new();
 
@@ -809,7 +797,7 @@ fn handle_prepare_rename(
 		return None;
 	}
 
-	symbols::find_symbol_kind(&doc.index, &word)?;
+	doc.index.definition(&word)?;
 
 	// The rename range covers the bare identifier, without the sigil `word_at`
 	// keeps — renaming `$myVar` rewrites `myVar` and leaves the `$`.
@@ -840,7 +828,7 @@ fn handle_rename(workspace: &Workspace, params: RenameParams) -> Option<Workspac
 	let at = &params.text_document_position;
 	let (doc, word) = workspace.word_at(&at.text_document.uri, at.position)?;
 	let bare = word.trim_start_matches('$').trim_start_matches('!');
-	let kind = symbols::find_symbol_kind(&doc.index, &word)?;
+	let kind = doc.index.definition(&word)?.kind;
 
 	if is_builtin(&word) {
 		return None;
@@ -860,22 +848,12 @@ fn handle_rename(workspace: &Workspace, params: RenameParams) -> Option<Workspac
 			})
 			.collect();
 
-		for sym in &other.index.symbols {
-			if sym.name.eq_ignore_ascii_case(bare) && sym.kind == kind {
-				edits.push(TextEdit {
-					range: sym.selection_range,
-					new_text: new_name.clone(),
-				});
-			}
-			for child in &sym.children {
-				if child.name.eq_ignore_ascii_case(bare) && child.kind == kind {
-					edits.push(TextEdit {
-						range: child.selection_range,
-						new_text: new_name.clone(),
-					});
-				}
-			}
-		}
+		// The references above are use sites; the declarations themselves have to
+		// be rewritten too.
+		edits.extend(other.index.definitions_of(bare, kind).map(|sym| TextEdit {
+			range: sym.selection_range,
+			new_text: new_name.clone(),
+		}));
 
 		if !edits.is_empty() {
 			changes.insert(other.uri.clone(), edits);
@@ -1479,6 +1457,23 @@ mod tests {
 		}
 	}
 
+	/// The user points at `$myVar`, but the `Var` line declares it bare. Both
+	/// spellings have to reach the same declaration.
+	#[test]
+	fn goto_definition_follows_a_sigil_to_the_bare_declaration() {
+		let workspace = workspace_with(&[(A_URI, "Var myVar\nStrCpy $myVar \"x\"")]);
+		let params = GotoDefinitionParams {
+			text_document_position_params: position_params(A_URI, 1, 10),
+			work_done_progress_params: Default::default(),
+			partial_result_params: Default::default(),
+		};
+
+		match handle_goto_definition(&workspace, params) {
+			Some(GotoDefinitionResponse::Scalar(loc)) => assert_eq!(loc.range.start.line, 0),
+			other => panic!("unexpected definition response: {other:?}"),
+		}
+	}
+
 	#[test]
 	fn requests_for_an_unopened_document_are_none() {
 		let workspace = two_documents();
@@ -1774,7 +1769,7 @@ mod tests {
 		);
 
 		let doc = workspace.document(&uri(TEST_URI)).unwrap();
-		assert_eq!(doc.index.symbols.len(), 1);
+		assert_eq!(doc.index.roots().len(), 1);
 
 		let published = client.diagnostics();
 		assert_eq!(published.len(), 1);
