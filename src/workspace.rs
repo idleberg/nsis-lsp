@@ -3,24 +3,37 @@
 
 use std::collections::HashMap;
 
-use lsp_types::{Position, Uri};
+use lsp_types::{Diagnostic, Position, Uri};
 
 use crate::context::{self, SyntaxContext};
+use crate::deprecation;
 use crate::position::{byte_to_utf16_offset, is_ident_char, line_at, utf16_to_byte_offset};
 use crate::symbols::{self, DocumentIndex};
 
-/// One open document: the `Uri` it arrived under, its current text, and the
-/// index derived from that text.
+/// One open document: the `Uri` it arrived under, its current text, and
+/// everything derived from that text.
 pub struct Document {
 	pub uri: Uri,
 	pub text: String,
 	pub index: DocumentIndex,
+	/// The diagnostics that follow from the text alone.
+	///
+	/// Compiler diagnostics are not here: they need makensis and a file on
+	/// disk, so they are merged on top at publish time rather than stored
+	/// against the document.
+	pub diagnostics: Vec<Diagnostic>,
 }
 
 impl Document {
 	fn new(uri: Uri, text: String) -> Self {
 		let index = symbols::index_document(&text);
-		Self { uri, text, index }
+		let diagnostics = deprecation::scan(&text);
+		Self {
+			uri,
+			text,
+			index,
+			diagnostics,
+		}
 	}
 
 	/// The identifier under `pos`, including a leading `!` or `$` if one is
@@ -90,11 +103,17 @@ impl Workspace {
 	}
 
 	/// Takes `text` as the current content of `uri`, replacing whatever was
-	/// there and reindexing. Both `didOpen` and `didChange` land here: the
-	/// server holds full document text, so a change is just a fresh open.
-	pub fn open(&mut self, uri: Uri, text: String) {
+	/// there and recomputing everything derived from it. Both `didOpen` and
+	/// `didChange` land here: the server holds full document text, so a change
+	/// is just a fresh open.
+	///
+	/// Returns the document it just stored, so a caller that has to publish
+	/// what the new text implies has it to hand.
+	pub fn open(&mut self, uri: Uri, text: String) -> &Document {
 		self.documents
-			.insert(uri.as_str().to_string(), Document::new(uri, text));
+			.entry(uri.as_str().to_string())
+			.insert_entry(Document::new(uri, text))
+			.into_mut()
 	}
 
 	pub fn document(&self, uri: &Uri) -> Option<&Document> {
@@ -210,6 +229,26 @@ mod tests {
 		assert_eq!(workspace.documents().count(), 1);
 		let doc = workspace.document(&uri(URI)).unwrap();
 		assert_eq!(doc.index.roots()[0].name, "new");
+	}
+
+	/// The index is not the only thing the text implies — a document knows its
+	/// own deprecation warnings too, so nothing has to re-walk it to find them.
+	#[test]
+	fn open_scans_the_document_as_well_as_indexing_it() {
+		let mut workspace = Workspace::new();
+		let doc = workspace.open(uri(URI), "SubSection foo".to_string());
+
+		assert_eq!(doc.diagnostics.len(), 1);
+		assert_eq!(doc.diagnostics[0].range.start.line, 0);
+	}
+
+	#[test]
+	fn open_replaces_the_diagnostics_too() {
+		let mut workspace = Workspace::new();
+		workspace.open(uri(URI), "SubSection foo".to_string());
+		let doc = workspace.open(uri(URI), "SectionGroup foo".to_string());
+
+		assert!(doc.diagnostics.is_empty());
 	}
 
 	#[test]

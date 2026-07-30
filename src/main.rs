@@ -42,7 +42,7 @@ use context::SyntaxContext;
 use nsis_data::Known;
 use position::{byte_to_utf16_offset, is_ident_char, line_at, utf16_to_byte_offset};
 use symbols::DocumentIndex;
-use workspace::Workspace;
+use workspace::{Document, Workspace};
 
 #[derive(Debug, Default, Deserialize)]
 struct InitOptions {
@@ -308,21 +308,18 @@ fn handle_notification(
 	if let Some(params) = cast_notification::<DidChangeConfiguration>(not.clone()) {
 		handle_configuration_change(client, params.settings, state);
 	} else if let Some(params) = cast_notification::<DidOpenTextDocument>(not.clone()) {
-		let uri = params.text_document.uri;
-		let text = params.text_document.text;
-		publish_diagnostics(client, uri.clone(), &text);
-		workspace.open(uri, text);
+		let doc = workspace.open(params.text_document.uri, params.text_document.text);
+		client.publish_diagnostics(doc.uri.clone(), doc.diagnostics.clone());
 	} else if let Some(params) = cast_notification::<DidChangeTextDocument>(not.clone())
 		&& let Some(change) = params.content_changes.into_iter().last()
 	{
-		let uri = params.text_document.uri;
-		publish_diagnostics(client, uri.clone(), &change.text);
-		workspace.open(uri, change.text);
+		let doc = workspace.open(params.text_document.uri, change.text);
+		client.publish_diagnostics(doc.uri.clone(), doc.diagnostics.clone());
 	} else if let Some(params) = cast_notification::<DidSaveTextDocument>(not)
 		&& state.diagnostics_on_save
 		&& let Some(doc) = workspace.document(&params.text_document.uri)
 	{
-		run_compiler_diagnostics(client, state, &doc.uri, &doc.text);
+		run_compiler_diagnostics(client, state, doc);
 	}
 }
 
@@ -391,33 +388,32 @@ fn log_makensis_path(client: &impl Client, path: Option<&str>) {
 	}
 }
 
-fn run_compiler_diagnostics(
-	client: &impl Client,
-	state: &LspState,
-	uri: &lsp_types::Uri,
-	text: &str,
-) {
+/// Republish `doc`'s diagnostics with what the compiler has to say on top.
+///
+/// The document's own diagnostics come along because the client replaces the
+/// whole set for a URI on every publish — dropping them here would clear the
+/// deprecation warnings the moment the file was saved.
+fn run_compiler_diagnostics(client: &impl Client, state: &LspState, doc: &Document) {
 	let Some(makensis_path) = &state.makensis_path else {
 		return;
 	};
 
-	let Some(file_path) = uri_to_file_path(&uri.to_string()) else {
+	let Some(file_path) = uri_to_file_path(&doc.uri.to_string()) else {
 		return;
 	};
-
-	let mut all_diagnostics = deprecation::scan(text);
 
 	let Ok(output) = compiler::run_makensis(makensis_path, &file_path, &state.preprocess_mode)
 	else {
 		return;
 	};
 
+	let mut all_diagnostics = doc.diagnostics.clone();
 	all_diagnostics.extend(diagnostics::parse_warnings(&output.stdout));
 	if let Some(diag) = diagnostics::parse_error(&output.stderr) {
 		all_diagnostics.push(diag);
 	}
 
-	client.publish_diagnostics(uri.clone(), all_diagnostics);
+	client.publish_diagnostics(doc.uri.clone(), all_diagnostics);
 }
 
 // ── Formatting ──
@@ -642,10 +638,6 @@ fn parse_error_position(msg: &str) -> Option<(u32, u32)> {
 		.unwrap_or(after_colon.len());
 	let col: u32 = after_colon[..end].parse().ok()?;
 	Some((line.saturating_sub(1), col.saturating_sub(1)))
-}
-
-fn publish_diagnostics(client: &impl Client, uri: lsp_types::Uri, text: &str) {
-	client.publish_diagnostics(uri, deprecation::scan(text));
 }
 
 // ── Go to Definition ──
@@ -1684,6 +1676,7 @@ mod tests {
 		let published = client.diagnostics();
 		assert_eq!(published.len(), 1);
 		assert_eq!(published[0].uri, uri(TEST_URI));
+		assert_eq!(published[0].diagnostics, doc.diagnostics);
 	}
 
 	/// A change carries the whole document, so the diagnostics that go with it
@@ -1707,11 +1700,46 @@ mod tests {
 			&mut state,
 		);
 
-		assert_eq!(
-			workspace.document(&uri(TEST_URI)).unwrap().text,
-			"Function myFunc\nFunctionEnd"
+		let doc = workspace.document(&uri(TEST_URI)).unwrap();
+		assert_eq!(doc.text, "Function myFunc\nFunctionEnd");
+
+		let published = client.diagnostics();
+		assert_eq!(published.len(), 2);
+		assert_eq!(published[1].diagnostics, doc.diagnostics);
+	}
+
+	/// The document is the one source of what its text implies, so a warning
+	/// cannot outlive the text that produced it: the edit that fixes the script
+	/// is the edit that clears the warning.
+	#[test]
+	fn fixing_the_text_clears_the_warning_it_produced() {
+		let client = Recorder::new();
+		let mut workspace = Workspace::new();
+		let mut state = quiet_state();
+
+		handle_notification(
+			&client,
+			did_open(TEST_URI, "SubSection foo"),
+			&mut workspace,
+			&mut state,
 		);
-		assert_eq!(client.diagnostics().len(), 2);
+		handle_notification(
+			&client,
+			did_change(TEST_URI, "SectionGroup foo"),
+			&mut workspace,
+			&mut state,
+		);
+
+		let published = client.diagnostics();
+		assert_eq!(published[0].diagnostics.len(), 1);
+		assert!(published[1].diagnostics.is_empty());
+		assert!(
+			workspace
+				.document(&uri(TEST_URI))
+				.unwrap()
+				.diagnostics
+				.is_empty()
+		);
 	}
 
 	/// Without a compiler there is nothing to run on save, and the diagnostics
