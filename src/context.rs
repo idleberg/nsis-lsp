@@ -18,13 +18,18 @@ pub fn context_at(text: &str, line: u32, col: usize) -> SyntaxContext {
 	let mut in_block_comment = false;
 
 	for (i, line_str) in text.lines().enumerate() {
-		let stop_at = if i == target { Some(col) } else { None };
-		if let Some(ctx) = scan_line(line_str, &mut in_block_comment, stop_at) {
-			return ctx;
+		if i != target {
+			scan_line(line_str, &mut in_block_comment, &mut |_, _, _| {});
+			continue;
 		}
-		if i == target {
-			return SyntaxContext::Code;
-		}
+		let mut found = None;
+		let at_end = scan_line(line_str, &mut in_block_comment, &mut |start, end, ctx| {
+			if found.is_none() && col >= start && col < end {
+				found = Some(ctx);
+			}
+		});
+		// A column past the last byte takes the context the line ended in.
+		return found.unwrap_or(at_end);
 	}
 
 	if in_block_comment {
@@ -34,22 +39,68 @@ pub fn context_at(text: &str, line: u32, col: usize) -> SyntaxContext {
 	}
 }
 
-/// Scan a single line, updating the block-comment state. When `stop_at` is set,
-/// returns the context at that byte offset; otherwise returns `None`.
+/// Walks a script line by line, carrying block-comment state across them, and
+/// hands back the code of each line with comment text blanked out.
+///
+/// This is the same scan `context_at` runs, exposed for consumers that search a
+/// whole line rather than ask about one position — comment text is replaced by
+/// spaces rather than removed, so byte offsets into the result still address
+/// the original line.
+pub struct CodeScan {
+	in_block_comment: bool,
+}
+
+impl CodeScan {
+	pub fn new() -> Self {
+		Self {
+			in_block_comment: false,
+		}
+	}
+
+	/// The code of `line`: every byte that belongs to a comment replaced by a
+	/// space. String contents are kept — `"${APP_NAME}"` is real script text.
+	pub fn code_of(&mut self, line: &str) -> String {
+		let mut bytes = line.as_bytes().to_vec();
+		let len = bytes.len();
+		scan_line(line, &mut self.in_block_comment, &mut |start, end, ctx| {
+			if ctx == SyntaxContext::Comment {
+				bytes[start..end.min(len)].fill(b' ');
+			}
+		});
+		String::from_utf8(bytes).unwrap_or_else(|_| line.to_string())
+	}
+}
+
+impl Default for CodeScan {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+/// Scan a single line, updating the block-comment state and emitting one span
+/// per stretch of same-context bytes. Returns the context the line ends in.
+///
+/// Spans cover the whole line and only ever break on ASCII markers, so their
+/// bounds are always char boundaries.
 fn scan_line(
 	line: &str,
 	in_block_comment: &mut bool,
-	stop_at: Option<usize>,
-) -> Option<SyntaxContext> {
+	on_span: &mut impl FnMut(usize, usize, SyntaxContext),
+) -> SyntaxContext {
 	let bytes = line.as_bytes();
 	let mut in_string: Option<u8> = None;
+	let mut span_start = 0;
+	let mut span_ctx = current_context(*in_block_comment, None);
 	let mut j = 0;
 
 	while j < bytes.len() {
-		if let Some(stop) = stop_at
-			&& j >= stop
-		{
-			return Some(current_context(*in_block_comment, in_string));
+		let here = current_context(*in_block_comment, in_string);
+		if here != span_ctx {
+			if j > span_start {
+				on_span(span_start, j, span_ctx);
+			}
+			span_start = j;
+			span_ctx = here;
 		}
 
 		if *in_block_comment {
@@ -81,10 +132,19 @@ fn scan_line(
 
 		if bytes[j] == b';' || bytes[j] == b'#' {
 			// Rest of the line is a comment.
-			return stop_at.map(|_| SyntaxContext::Comment);
+			if j > span_start {
+				on_span(span_start, j, span_ctx);
+			}
+			on_span(j, bytes.len(), SyntaxContext::Comment);
+			return SyntaxContext::Comment;
 		}
 
 		if bytes[j] == b'/' && bytes.get(j + 1) == Some(&b'*') {
+			if j > span_start {
+				on_span(span_start, j, span_ctx);
+			}
+			span_start = j;
+			span_ctx = SyntaxContext::Comment;
 			*in_block_comment = true;
 			j += 2;
 			continue;
@@ -96,7 +156,10 @@ fn scan_line(
 		j += 1;
 	}
 
-	stop_at.map(|_| current_context(*in_block_comment, in_string))
+	if bytes.len() > span_start {
+		on_span(span_start, bytes.len(), span_ctx);
+	}
+	current_context(*in_block_comment, in_string)
 }
 
 fn current_context(in_block_comment: bool, in_string: Option<u8>) -> SyntaxContext {
@@ -193,5 +256,65 @@ mod tests {
 	fn end_of_line_inside_string() {
 		let text = "DetailPrint \"abc";
 		assert_eq!(context_at(text, 0, 16), SyntaxContext::String);
+	}
+
+	// ── CodeScan ──
+
+	/// Every code view has the same byte length as its line, so offsets found
+	/// in one address the other.
+	fn code_of(line: &str) -> String {
+		let out = CodeScan::new().code_of(line);
+		assert_eq!(out.len(), line.len());
+		out
+	}
+
+	#[test]
+	fn code_keeps_a_line_without_comments() {
+		assert_eq!(
+			code_of("DetailPrint ${APP_NAME}"),
+			"DetailPrint ${APP_NAME}"
+		);
+	}
+
+	#[test]
+	fn code_blanks_a_trailing_comment() {
+		assert_eq!(
+			code_of("DetailPrint hi ; see ${APP_NAME}"),
+			"DetailPrint hi                  "
+		);
+	}
+
+	#[test]
+	fn code_blanks_a_whole_line_comment() {
+		assert_eq!(code_of("# Call myFunc").trim(), "");
+		assert_eq!(code_of("  ; Var notReal").trim(), "");
+	}
+
+	#[test]
+	fn code_keeps_string_contents() {
+		assert_eq!(code_of(r#"DetailPrint "a ; b""#), r#"DetailPrint "a ; b""#);
+	}
+
+	#[test]
+	fn code_blanks_an_inline_block_comment() {
+		assert_eq!(
+			code_of("Function /* aside */ myFunc"),
+			"Function             myFunc"
+		);
+	}
+
+	#[test]
+	fn code_carries_block_comments_across_lines() {
+		let mut scan = CodeScan::new();
+		assert_eq!(scan.code_of("/* Function fake").trim(), "");
+		assert_eq!(scan.code_of("Var notReal */").trim(), "");
+		assert_eq!(scan.code_of("Function real"), "Function real");
+	}
+
+	#[test]
+	fn code_survives_multibyte_comment_text() {
+		let line = "DetailPrint hi ; ünïcode";
+		let out = code_of(line);
+		assert_eq!(out.trim(), "DetailPrint hi");
 	}
 }

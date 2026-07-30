@@ -1,5 +1,8 @@
 use lsp_types::{Position, Range, SymbolKind};
 
+use crate::context::CodeScan;
+use crate::position::{byte_to_utf16_offset, is_ident_char};
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NsisSymbolKind {
 	Function,
@@ -32,22 +35,76 @@ pub struct SymbolDef {
 	pub children: Vec<SymbolDef>,
 }
 
+/// Every definition in one document.
+///
+/// The symbols are nested two deep — containers (`Function`, `Section`,
+/// `!macro`) hold the labels declared inside them — because `documentSymbol`
+/// wants that shape. Every other caller wants to look a name up, so the `Vec`
+/// stays private and the lookups live here, with one matching rule instead of
+/// one per call site.
 pub struct DocumentIndex {
-	pub symbols: Vec<SymbolDef>,
+	symbols: Vec<SymbolDef>,
+}
+
+impl DocumentIndex {
+	/// The top-level definitions, each still carrying its children. Only
+	/// `documentSymbol`, which reports the tree as it stands, needs this.
+	pub fn roots(&self) -> &[SymbolDef] {
+		&self.symbols
+	}
+
+	/// Every definition, container and child alike, each container ahead of the
+	/// labels inside it.
+	fn all(&self) -> impl Iterator<Item = &SymbolDef> {
+		self.symbols
+			.iter()
+			.flat_map(|sym| std::iter::once(sym).chain(sym.children.iter()))
+	}
+
+	/// The definition of `word`, or `None` if the document defines nothing by
+	/// that name.
+	///
+	/// Case is ignored, and so is a leading `$` or `!`: the user points at
+	/// `$myVar` or `!MyMacro`, but the definition is recorded under the bare
+	/// name.
+	pub fn definition(&self, word: &str) -> Option<&SymbolDef> {
+		let bare = strip_sigils(word);
+		self.all()
+			.find(|sym| sym.name.eq_ignore_ascii_case(bare) || sym.name.eq_ignore_ascii_case(word))
+	}
+
+	/// Every definition of `name` as a `kind`. A rename has to rewrite all of
+	/// them — the same label name may be declared in more than one function.
+	pub fn definitions_of(
+		&self,
+		name: &str,
+		kind: NsisSymbolKind,
+	) -> impl Iterator<Item = &SymbolDef> {
+		let bare = strip_sigils(name);
+		self.all()
+			.filter(move |sym| sym.kind == kind && sym.name.eq_ignore_ascii_case(bare))
+	}
+}
+
+/// The bare identifier, without the `$` or `!` a caller may have written.
+fn strip_sigils(word: &str) -> &str {
+	word.trim_start_matches('$').trim_start_matches('!')
 }
 
 pub fn index_document(text: &str) -> DocumentIndex {
 	let mut symbols: Vec<SymbolDef> = Vec::new();
 	let mut container: Option<ContainerState> = None;
-	let mut in_block_comment = false;
+	let mut scan = CodeScan::new();
+	let mut last_end = Position::new(0, 0);
 
 	for (line_num, line) in text.lines().enumerate() {
 		let line_n = line_num as u32;
-		let bytes = line.as_bytes();
 
-		// Track block comments
-		let (trimmed, still_in_block) = skip_comment_prefix(bytes, in_block_comment);
-		in_block_comment = still_in_block;
+		// Comments are blanked out, so only script text is matched below.
+		let code = scan.code_of(line);
+		last_end = line_end_position(line_n, line, &code);
+
+		let trimmed = code.trim();
 		if trimmed.is_empty() {
 			continue;
 		}
@@ -57,7 +114,7 @@ pub fn index_document(text: &str) -> DocumentIndex {
 		// Close containers
 		if lower == "functionend" || lower == "sectionend" || lower == "!macroend" {
 			if let Some(mut cs) = container.take() {
-				cs.symbol.range.end = line_end_position(line_n, line);
+				cs.symbol.range.end = line_end_position(line_n, line, &code);
 				symbols.push(cs.symbol);
 			}
 			continue;
@@ -68,13 +125,13 @@ pub fn index_document(text: &str) -> DocumentIndex {
 			let name = first_token(&trimmed[lower.len() - rest.len()..]);
 			if !name.is_empty() {
 				close_container(&mut container, &mut symbols, line_n);
-				let sel = name_range(line_n, line, &name);
+				let sel = name_range(line_n, line, &code, &name);
 				container = Some(ContainerState {
 					symbol: SymbolDef {
 						name: name.to_string(),
 						kind: NsisSymbolKind::Function,
 						range: Range::new(
-							line_start_position(line_n, line),
+							line_start_position(line_n, line, &code),
 							Position::new(line_n, 0),
 						),
 						selection_range: sel,
@@ -90,13 +147,13 @@ pub fn index_document(text: &str) -> DocumentIndex {
 			let name = first_token(&trimmed[lower.len() - rest.len()..]);
 			if !name.is_empty() {
 				close_container(&mut container, &mut symbols, line_n);
-				let sel = name_range(line_n, line, &name);
+				let sel = name_range(line_n, line, &code, &name);
 				container = Some(ContainerState {
 					symbol: SymbolDef {
 						name: name.to_string(),
 						kind: NsisSymbolKind::Macro,
 						range: Range::new(
-							line_start_position(line_n, line),
+							line_start_position(line_n, line, &code),
 							Position::new(line_n, 0),
 						),
 						selection_range: sel,
@@ -113,13 +170,13 @@ pub fn index_document(text: &str) -> DocumentIndex {
 			let (name, _section_id) = parse_section_name(after_keyword);
 			if !name.is_empty() {
 				close_container(&mut container, &mut symbols, line_n);
-				let sel = name_range(line_n, line, &name);
+				let sel = name_range(line_n, line, &code, &name);
 				container = Some(ContainerState {
 					symbol: SymbolDef {
 						name: name.to_string(),
 						kind: NsisSymbolKind::Section,
 						range: Range::new(
-							line_start_position(line_n, line),
+							line_start_position(line_n, line, &code),
 							Position::new(line_n, 0),
 						),
 						selection_range: sel,
@@ -133,12 +190,15 @@ pub fn index_document(text: &str) -> DocumentIndex {
 		// Bare "Section" with no name (e.g. unnamed section)
 		if lower == "section" {
 			close_container(&mut container, &mut symbols, line_n);
-			let sel = name_range(line_n, line, "Section");
+			let sel = name_range(line_n, line, &code, "Section");
 			container = Some(ContainerState {
 				symbol: SymbolDef {
 					name: String::new(),
 					kind: NsisSymbolKind::Section,
-					range: Range::new(line_start_position(line_n, line), Position::new(line_n, 0)),
+					range: Range::new(
+						line_start_position(line_n, line, &code),
+						Position::new(line_n, 0),
+					),
 					selection_range: sel,
 					children: Vec::new(),
 				},
@@ -155,11 +215,11 @@ pub fn index_document(text: &str) -> DocumentIndex {
 				first_token(after)
 			};
 			if !name.is_empty() {
-				let sel = name_range(line_n, line, &name);
+				let sel = name_range(line_n, line, &code, &name);
 				let sym = SymbolDef {
 					name: name.to_string(),
 					kind: NsisSymbolKind::Variable,
-					range: make_line_range(line_n, line),
+					range: make_line_range(line_n, line, &code),
 					selection_range: sel,
 					children: Vec::new(),
 				};
@@ -173,11 +233,11 @@ pub fn index_document(text: &str) -> DocumentIndex {
 			let after = &trimmed[lower.len() - rest.len()..];
 			let name = first_token(after);
 			if !name.is_empty() && !name.starts_with('/') {
-				let sel = name_range(line_n, line, &name);
+				let sel = name_range(line_n, line, &code, &name);
 				let sym = SymbolDef {
 					name: name.to_string(),
 					kind: NsisSymbolKind::Define,
-					range: make_line_range(line_n, line),
+					range: make_line_range(line_n, line, &code),
 					selection_range: sel,
 					children: Vec::new(),
 				};
@@ -186,19 +246,14 @@ pub fn index_document(text: &str) -> DocumentIndex {
 			continue;
 		}
 
-		// Labels: <name>: (no spaces, not a comment)
-		if trimmed.ends_with(':')
-			&& !trimmed.contains(' ')
-			&& !trimmed.starts_with(';')
-			&& !trimmed.starts_with('#')
-			&& trimmed.len() > 1
-		{
+		// Labels: <name>: (no spaces)
+		if trimmed.ends_with(':') && !trimmed.contains(' ') && trimmed.len() > 1 {
 			let label = &trimmed[..trimmed.len() - 1];
-			let sel = name_range(line_n, line, label);
+			let sel = name_range(line_n, line, &code, label);
 			let sym = SymbolDef {
 				name: label.to_string(),
 				kind: NsisSymbolKind::Label,
-				range: make_line_range(line_n, line),
+				range: make_line_range(line_n, line, &code),
 				selection_range: sel,
 				children: Vec::new(),
 			};
@@ -213,9 +268,7 @@ pub fn index_document(text: &str) -> DocumentIndex {
 
 	// Close any unclosed container at end of file
 	if let Some(mut cs) = container {
-		let last_line = text.lines().count().saturating_sub(1) as u32;
-		let last_text = text.lines().last().unwrap_or("");
-		cs.symbol.range.end = line_end_position(last_line, last_text);
+		cs.symbol.range.end = last_end;
 		symbols.push(cs.symbol);
 	}
 
@@ -280,86 +333,73 @@ fn parse_section_name(after_keyword: &str) -> (String, Option<String>) {
 	(token, None)
 }
 
-fn byte_to_utf16(line: &str, byte_offset: usize) -> u32 {
-	let mut count = 0u32;
-	for ch in line[..byte_offset].chars() {
-		count += ch.len_utf16() as u32;
-	}
-	count
-}
+// The four helpers below take a line twice: `code` to locate a byte offset,
+// `line` to turn that offset into a UTF-16 column. Blanking a comment preserves
+// byte offsets but not UTF-16 ones, so the columns must come from the raw line.
 
-fn name_range(line_num: u32, line: &str, name: &str) -> Range {
-	if let Some(byte_start) = line.find(name) {
-		let start = byte_to_utf16(line, byte_start);
-		let end = byte_to_utf16(line, byte_start + name.len());
+fn name_range(line_num: u32, line: &str, code: &str, name: &str) -> Range {
+	if let Some(byte_start) = code.find(name) {
+		let start = byte_to_utf16_offset(line, byte_start);
+		let end = byte_to_utf16_offset(line, byte_start + name.len());
 		Range::new(Position::new(line_num, start), Position::new(line_num, end))
 	} else {
-		make_line_range(line_num, line)
+		make_line_range(line_num, line, code)
 	}
 }
 
-fn make_line_range(line_num: u32, line: &str) -> Range {
-	let leading = line.len() - line.trim_start().len();
-	let trailing = line.trim_end().len();
+fn make_line_range(line_num: u32, line: &str, code: &str) -> Range {
 	Range::new(
-		Position::new(line_num, byte_to_utf16(line, leading)),
-		Position::new(line_num, byte_to_utf16(line, trailing)),
+		line_start_position(line_num, line, code),
+		line_end_position(line_num, line, code),
 	)
 }
 
-fn line_start_position(line_num: u32, line: &str) -> Position {
-	let leading = line.len() - line.trim_start().len();
-	Position::new(line_num, byte_to_utf16(line, leading))
+fn line_start_position(line_num: u32, line: &str, code: &str) -> Position {
+	let leading = code.len() - code.trim_start().len();
+	Position::new(line_num, byte_to_utf16_offset(line, leading))
 }
 
-fn line_end_position(line_num: u32, line: &str) -> Position {
-	Position::new(line_num, byte_to_utf16(line, line.trim_end().len()))
-}
-
-pub fn find_symbol_kind(index: &DocumentIndex, word: &str) -> Option<NsisSymbolKind> {
-	let bare = word.trim_start_matches('$').trim_start_matches('!');
-	for sym in &index.symbols {
-		if sym.name.eq_ignore_ascii_case(bare) || sym.name.eq_ignore_ascii_case(word) {
-			return Some(sym.kind);
-		}
-		for child in &sym.children {
-			if child.name.eq_ignore_ascii_case(bare) || child.name.eq_ignore_ascii_case(word) {
-				return Some(child.kind);
-			}
-		}
-	}
-	None
+fn line_end_position(line_num: u32, line: &str, code: &str) -> Position {
+	Position::new(line_num, byte_to_utf16_offset(line, code.trim_end().len()))
 }
 
 pub fn find_references(text: &str, name: &str, kind: NsisSymbolKind) -> Vec<Range> {
 	let mut refs = Vec::new();
-	let mut in_block_comment = false;
+	let mut scan = CodeScan::new();
 
 	for (line_num, line) in text.lines().enumerate() {
 		let line_n = line_num as u32;
-		let (trimmed, still_in_block) = skip_comment_prefix(line.as_bytes(), in_block_comment);
-		in_block_comment = still_in_block;
-		if trimmed.is_empty() {
+
+		// Searching the code view rather than the raw line keeps a name written
+		// inside a comment from being reported — and renamed.
+		let code = scan.code_of(line);
+		if code.trim().is_empty() {
 			continue;
 		}
+		let at = LineRefs {
+			line,
+			code: &code,
+			line_n,
+			name,
+		};
 
 		match kind {
 			NsisSymbolKind::Function => {
-				find_call_refs(line, line_n, name, &mut refs);
+				at.find_call_refs(&mut refs);
 			}
 			NsisSymbolKind::Macro => {
-				find_insertmacro_refs(line, line_n, name, &mut refs);
-				find_deref_refs(line, line_n, name, &mut refs);
+				at.find_insertmacro_refs(&mut refs);
+				at.find_deref_refs(&mut refs);
 			}
 			NsisSymbolKind::Variable => {
-				find_variable_refs(line, line_n, name, &mut refs);
+				at.find_variable_refs(&mut refs);
 			}
 			NsisSymbolKind::Define => {
-				find_deref_refs(line, line_n, name, &mut refs);
+				at.find_deref_refs(&mut refs);
 			}
 			NsisSymbolKind::Label => {
-				find_goto_refs(line, line_n, name, &mut refs);
-				find_label_jump_refs(line, line_n, name, &mut refs);
+				at.find_goto_refs(&mut refs);
+				at.find_label_jump_refs(&mut refs);
 			}
 			NsisSymbolKind::Section => {}
 		}
@@ -368,182 +408,125 @@ pub fn find_references(text: &str, name: &str, kind: NsisSymbolKind) -> Vec<Rang
 	refs
 }
 
-fn find_call_refs(line: &str, line_n: u32, name: &str, refs: &mut Vec<Range>) {
-	let lower = line.trim().to_lowercase();
-	if let Some(rest) = lower.strip_prefix("call ") {
-		let callee = rest.trim();
-		if callee.eq_ignore_ascii_case(name)
-			&& let Some(pos) = line.to_lowercase().rfind(&name.to_lowercase())
-		{
-			let start = byte_to_utf16(line, pos);
-			let end = byte_to_utf16(line, pos + name.len());
-			refs.push(Range::new(
-				Position::new(line_n, start),
-				Position::new(line_n, end),
-			));
-		}
+/// One line under search: `code` is what the scanners match against, `line` is
+/// what byte offsets are turned into UTF-16 columns against.
+struct LineRefs<'a> {
+	line: &'a str,
+	code: &'a str,
+	line_n: u32,
+	name: &'a str,
+}
+
+impl LineRefs<'_> {
+	/// The range covering `len` bytes from `byte_offset`, in UTF-16 columns.
+	fn range_at(&self, byte_offset: usize, len: usize) -> Range {
+		Range::new(
+			Position::new(self.line_n, byte_to_utf16_offset(self.line, byte_offset)),
+			Position::new(
+				self.line_n,
+				byte_to_utf16_offset(self.line, byte_offset + len),
+			),
+		)
 	}
 }
 
-fn find_insertmacro_refs(line: &str, line_n: u32, name: &str, refs: &mut Vec<Range>) {
-	let lower = line.trim().to_lowercase();
-	if let Some(rest) = lower.strip_prefix("!insertmacro ") {
-		let macro_name = rest.split_whitespace().next().unwrap_or("");
-		if macro_name.eq_ignore_ascii_case(name) {
-			let lower_line = line.to_lowercase();
-			let lower_name = name.to_lowercase();
-			if let Some(im_pos) = lower_line.find("!insertmacro") {
-				let after = im_pos + "!insertmacro".len();
-				if let Some(rel) = lower_line[after..].find(&lower_name) {
-					let pos = after + rel;
-					let start = byte_to_utf16(line, pos);
-					let end = byte_to_utf16(line, pos + name.len());
-					refs.push(Range::new(
-						Position::new(line_n, start),
-						Position::new(line_n, end),
-					));
+impl LineRefs<'_> {
+	fn find_call_refs(&self, refs: &mut Vec<Range>) {
+		let lower = self.code.trim().to_lowercase();
+		if let Some(rest) = lower.strip_prefix("call ") {
+			let callee = rest.trim();
+			if callee.eq_ignore_ascii_case(self.name)
+				&& let Some(pos) = self.code.to_lowercase().rfind(&self.name.to_lowercase())
+			{
+				refs.push(self.range_at(pos, self.name.len()));
+			}
+		}
+	}
+
+	fn find_insertmacro_refs(&self, refs: &mut Vec<Range>) {
+		let lower = self.code.trim().to_lowercase();
+		if let Some(rest) = lower.strip_prefix("!insertmacro ") {
+			let macro_name = rest.split_whitespace().next().unwrap_or("");
+			if macro_name.eq_ignore_ascii_case(self.name) {
+				let lower_line = self.code.to_lowercase();
+				let lower_name = self.name.to_lowercase();
+				if let Some(im_pos) = lower_line.find("!insertmacro") {
+					let after = im_pos + "!insertmacro".len();
+					if let Some(rel) = lower_line[after..].find(&lower_name) {
+						refs.push(self.range_at(after + rel, self.name.len()));
+					}
 				}
 			}
 		}
 	}
-}
 
-fn find_deref_refs(line: &str, line_n: u32, name: &str, refs: &mut Vec<Range>) {
-	let lower_line = line.to_lowercase();
-	let pattern = format!("${{{}}}", name.to_lowercase());
-	let name_offset = 2; // skip "${"
-	let mut search_from = 0;
-	while let Some(pos) = lower_line[search_from..].find(&pattern) {
-		let abs_pos = search_from + pos + name_offset;
-		let start = byte_to_utf16(line, abs_pos);
-		let end = byte_to_utf16(line, abs_pos + name.len());
-		refs.push(Range::new(
-			Position::new(line_n, start),
-			Position::new(line_n, end),
-		));
-		search_from += pos + pattern.len();
-	}
-}
-
-fn find_variable_refs(line: &str, line_n: u32, name: &str, refs: &mut Vec<Range>) {
-	let lower_line = line.to_lowercase();
-	let pattern = format!("${}", name.to_lowercase());
-	let name_offset = 1; // skip "$"
-	let mut search_from = 0;
-	while let Some(pos) = lower_line[search_from..].find(&pattern) {
-		let abs_pos = search_from + pos;
-		let after = abs_pos + pattern.len();
-		// Check it's not ${name} (that's a define/macro deref)
-		if abs_pos + 1 < line.len() && line.as_bytes()[abs_pos + 1] == b'{' {
-			search_from = after;
-			continue;
-		}
-		// Check word boundary after
-		if after < line.len() && is_ident_byte(line.as_bytes()[after]) {
-			search_from = after;
-			continue;
-		}
-		let start = byte_to_utf16(line, abs_pos + name_offset);
-		let end = byte_to_utf16(line, after);
-		refs.push(Range::new(
-			Position::new(line_n, start),
-			Position::new(line_n, end),
-		));
-		search_from = after;
-	}
-}
-
-fn find_goto_refs(line: &str, line_n: u32, name: &str, refs: &mut Vec<Range>) {
-	let lower = line.trim().to_lowercase();
-	if let Some(rest) = lower.strip_prefix("goto ") {
-		let target = rest.trim();
-		if target.eq_ignore_ascii_case(name)
-			&& let Some(pos) = line.to_lowercase().rfind(&name.to_lowercase())
-		{
-			let start = byte_to_utf16(line, pos);
-			let end = byte_to_utf16(line, pos + name.len());
-			refs.push(Range::new(
-				Position::new(line_n, start),
-				Position::new(line_n, end),
-			));
+	fn find_deref_refs(&self, refs: &mut Vec<Range>) {
+		let lower_line = self.code.to_lowercase();
+		let pattern = format!("${{{}}}", self.name.to_lowercase());
+		let name_offset = 2; // skip "${"
+		let mut search_from = 0;
+		while let Some(pos) = lower_line[search_from..].find(&pattern) {
+			refs.push(self.range_at(search_from + pos + name_offset, self.name.len()));
+			search_from += pos + pattern.len();
 		}
 	}
-}
 
-fn find_label_jump_refs(line: &str, line_n: u32, name: &str, refs: &mut Vec<Range>) {
-	let lower_line = line.to_lowercase();
-	let lower_name = name.to_lowercase();
-	let words: Vec<&str> = line.split_whitespace().collect();
-	for (i, word) in words.iter().enumerate() {
-		if i == 0 {
-			continue;
-		}
-		let w_lower = word.to_lowercase();
-		if matches!(
-			w_lower.as_str(),
-			"idyes" | "idno" | "idok" | "idcancel" | "idabort" | "idretry" | "idignore"
-		) && let Some(next) = words.get(i + 1)
-			&& next.eq_ignore_ascii_case(name)
-			&& let Some(pos) = lower_line.rfind(&lower_name)
-		{
-			let start = byte_to_utf16(line, pos);
-			let end = byte_to_utf16(line, pos + name.len());
-			refs.push(Range::new(
-				Position::new(line_n, start),
-				Position::new(line_n, end),
-			));
-		}
-	}
-}
-
-fn is_ident_byte(b: u8) -> bool {
-	b.is_ascii_alphanumeric() || b == b'_' || b == b'.'
-}
-
-fn skip_comment_prefix(bytes: &[u8], mut in_block: bool) -> (String, bool) {
-	let mut i = 0;
-	// Skip leading whitespace
-	while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
-		i += 1;
-	}
-
-	if in_block {
-		// Look for end of block comment
-		while i + 1 < bytes.len() {
-			if bytes[i] == b'*' && bytes[i + 1] == b'/' {
-				in_block = false;
-				i += 2;
-				// Skip whitespace after block comment end
-				while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
-					i += 1;
-				}
-				break;
+	fn find_variable_refs(&self, refs: &mut Vec<Range>) {
+		let lower_line = self.code.to_lowercase();
+		let pattern = format!("${}", self.name.to_lowercase());
+		let name_offset = 1; // skip "$"
+		let bytes = self.code.as_bytes();
+		let mut search_from = 0;
+		while let Some(pos) = lower_line[search_from..].find(&pattern) {
+			let abs_pos = search_from + pos;
+			let after = abs_pos + pattern.len();
+			// Check it's not ${name} (that's a define/macro deref)
+			if abs_pos + 1 < bytes.len() && bytes[abs_pos + 1] == b'{' {
+				search_from = after;
+				continue;
 			}
-			i += 1;
-		}
-		if in_block {
-			return (String::new(), true);
-		}
-		if i >= bytes.len() {
-			return (String::new(), false);
+			// Check word boundary after
+			if after < bytes.len() && is_ident_char(bytes[after]) {
+				search_from = after;
+				continue;
+			}
+			refs.push(self.range_at(abs_pos + name_offset, after - abs_pos - name_offset));
+			search_from = after;
 		}
 	}
 
-	// Check for line comments
-	if i < bytes.len() && (bytes[i] == b'#' || bytes[i] == b';') {
-		return (String::new(), false);
+	fn find_goto_refs(&self, refs: &mut Vec<Range>) {
+		let lower = self.code.trim().to_lowercase();
+		if let Some(rest) = lower.strip_prefix("goto ") {
+			let target = rest.trim();
+			if target.eq_ignore_ascii_case(self.name)
+				&& let Some(pos) = self.code.to_lowercase().rfind(&self.name.to_lowercase())
+			{
+				refs.push(self.range_at(pos, self.name.len()));
+			}
+		}
 	}
 
-	// Check for block comment start
-	if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-		return (String::new(), true);
+	fn find_label_jump_refs(&self, refs: &mut Vec<Range>) {
+		let lower_line = self.code.to_lowercase();
+		let lower_name = self.name.to_lowercase();
+		let words: Vec<&str> = self.code.split_whitespace().collect();
+		for (i, word) in words.iter().enumerate() {
+			if i == 0 {
+				continue;
+			}
+			let w_lower = word.to_lowercase();
+			if matches!(
+				w_lower.as_str(),
+				"idyes" | "idno" | "idok" | "idcancel" | "idabort" | "idretry" | "idignore"
+			) && let Some(next) = words.get(i + 1)
+				&& next.eq_ignore_ascii_case(self.name)
+				&& let Some(pos) = lower_line.rfind(&lower_name)
+			{
+				refs.push(self.range_at(pos, self.name.len()));
+			}
+		}
 	}
-
-	let result = std::str::from_utf8(&bytes[i..])
-		.unwrap_or("")
-		.trim_end()
-		.to_string();
-	(result, false)
 }
 
 #[cfg(test)]
@@ -554,108 +537,108 @@ mod tests {
 	fn index_function_with_labels() {
 		let text = "Function myFunc\n  label1:\n  label2:\nFunctionEnd";
 		let idx = index_document(text);
-		assert_eq!(idx.symbols.len(), 1);
-		assert_eq!(idx.symbols[0].name, "myFunc");
-		assert_eq!(idx.symbols[0].kind, NsisSymbolKind::Function);
-		assert_eq!(idx.symbols[0].children.len(), 2);
-		assert_eq!(idx.symbols[0].children[0].name, "label1");
-		assert_eq!(idx.symbols[0].children[0].kind, NsisSymbolKind::Label);
-		assert_eq!(idx.symbols[0].children[1].name, "label2");
+		assert_eq!(idx.roots().len(), 1);
+		assert_eq!(idx.roots()[0].name, "myFunc");
+		assert_eq!(idx.roots()[0].kind, NsisSymbolKind::Function);
+		assert_eq!(idx.roots()[0].children.len(), 2);
+		assert_eq!(idx.roots()[0].children[0].name, "label1");
+		assert_eq!(idx.roots()[0].children[0].kind, NsisSymbolKind::Label);
+		assert_eq!(idx.roots()[0].children[1].name, "label2");
 	}
 
 	#[test]
 	fn index_macro() {
 		let text = "!macro MyMacro arg1 arg2\n  DetailPrint hello\n!macroend";
 		let idx = index_document(text);
-		assert_eq!(idx.symbols.len(), 1);
-		assert_eq!(idx.symbols[0].name, "MyMacro");
-		assert_eq!(idx.symbols[0].kind, NsisSymbolKind::Macro);
+		assert_eq!(idx.roots().len(), 1);
+		assert_eq!(idx.roots()[0].name, "MyMacro");
+		assert_eq!(idx.roots()[0].kind, NsisSymbolKind::Macro);
 	}
 
 	#[test]
 	fn index_section_with_display_name() {
 		let text = "Section \"Install Files\" sec_install\n  File app.exe\nSectionEnd";
 		let idx = index_document(text);
-		assert_eq!(idx.symbols.len(), 1);
-		assert_eq!(idx.symbols[0].name, "Install Files");
-		assert_eq!(idx.symbols[0].kind, NsisSymbolKind::Section);
+		assert_eq!(idx.roots().len(), 1);
+		assert_eq!(idx.roots()[0].name, "Install Files");
+		assert_eq!(idx.roots()[0].kind, NsisSymbolKind::Section);
 	}
 
 	#[test]
 	fn index_section_unquoted() {
 		let text = "Section main\nSectionEnd";
 		let idx = index_document(text);
-		assert_eq!(idx.symbols.len(), 1);
-		assert_eq!(idx.symbols[0].name, "main");
+		assert_eq!(idx.roots().len(), 1);
+		assert_eq!(idx.roots()[0].name, "main");
 	}
 
 	#[test]
 	fn index_section_with_flag() {
 		let text = "Section /e \"Optional\" sec_opt\nSectionEnd";
 		let idx = index_document(text);
-		assert_eq!(idx.symbols.len(), 1);
+		assert_eq!(idx.roots().len(), 1);
 		// /e flag should be handled, extracting the name after the flag
-		assert!(!idx.symbols[0].name.starts_with('/'));
+		assert!(!idx.roots()[0].name.starts_with('/'));
 	}
 
 	#[test]
 	fn index_variable() {
 		let text = "Var myVar\nVar /GLOBAL otherVar";
 		let idx = index_document(text);
-		assert_eq!(idx.symbols.len(), 2);
-		assert_eq!(idx.symbols[0].name, "myVar");
-		assert_eq!(idx.symbols[0].kind, NsisSymbolKind::Variable);
-		assert_eq!(idx.symbols[1].name, "otherVar");
+		assert_eq!(idx.roots().len(), 2);
+		assert_eq!(idx.roots()[0].name, "myVar");
+		assert_eq!(idx.roots()[0].kind, NsisSymbolKind::Variable);
+		assert_eq!(idx.roots()[1].name, "otherVar");
 	}
 
 	#[test]
 	fn index_define() {
 		let text = "!define APP_NAME \"MyApp\"\n!define VERSION 1.0";
 		let idx = index_document(text);
-		assert_eq!(idx.symbols.len(), 2);
-		assert_eq!(idx.symbols[0].name, "APP_NAME");
-		assert_eq!(idx.symbols[0].kind, NsisSymbolKind::Define);
-		assert_eq!(idx.symbols[1].name, "VERSION");
+		assert_eq!(idx.roots().len(), 2);
+		assert_eq!(idx.roots()[0].name, "APP_NAME");
+		assert_eq!(idx.roots()[0].kind, NsisSymbolKind::Define);
+		assert_eq!(idx.roots()[1].name, "VERSION");
 	}
 
 	#[test]
 	fn index_standalone_label() {
 		let text = "start:\n  DetailPrint hello";
 		let idx = index_document(text);
-		assert_eq!(idx.symbols.len(), 1);
-		assert_eq!(idx.symbols[0].name, "start");
-		assert_eq!(idx.symbols[0].kind, NsisSymbolKind::Label);
+		assert_eq!(idx.roots().len(), 1);
+		assert_eq!(idx.roots()[0].name, "start");
+		assert_eq!(idx.roots()[0].kind, NsisSymbolKind::Label);
 	}
 
 	#[test]
 	fn index_empty_file() {
 		let idx = index_document("");
-		assert!(idx.symbols.is_empty());
+		assert!(idx.roots().is_empty());
 	}
 
 	#[test]
 	fn index_skips_comments() {
 		let text = "# Function fake\n; Var notReal\nFunction real\nFunctionEnd";
 		let idx = index_document(text);
-		assert_eq!(idx.symbols.len(), 1);
-		assert_eq!(idx.symbols[0].name, "real");
+		assert_eq!(idx.roots().len(), 1);
+		assert_eq!(idx.roots()[0].name, "real");
 	}
 
 	#[test]
 	fn index_skips_block_comments() {
 		let text = "/* Function fake\nVar notReal */\nFunction real\nFunctionEnd";
 		let idx = index_document(text);
-		assert_eq!(idx.symbols.len(), 1);
-		assert_eq!(idx.symbols[0].name, "real");
+		assert_eq!(idx.roots().len(), 1);
+		assert_eq!(idx.roots()[0].name, "real");
 	}
 
 	#[test]
 	fn index_callback_function() {
 		let text = "Function .onInit\n  Abort\nFunctionEnd";
 		let idx = index_document(text);
-		assert_eq!(idx.symbols.len(), 1);
-		assert_eq!(idx.symbols[0].name, ".onInit");
-		assert_eq!(idx.symbols[0].kind, NsisSymbolKind::Function);
+		assert_eq!(idx.roots().len(), 1);
+		assert_eq!(idx.roots()[0].name, ".onInit");
+		assert_eq!(idx.roots()[0].kind, NsisSymbolKind::Function);
 	}
 
 	#[test]
@@ -675,37 +658,37 @@ SectionEnd
 !macro Helper
 !macroend";
 		let idx = index_document(text);
-		let names: Vec<&str> = idx.symbols.iter().map(|s| s.name.as_str()).collect();
+		let names: Vec<&str> = idx.roots().iter().map(|s| s.name.as_str()).collect();
 		assert_eq!(
 			names,
 			vec!["APP_NAME", "myVar", ".onInit", "Files", "Helper"]
 		);
-		assert_eq!(idx.symbols[2].children.len(), 1);
-		assert_eq!(idx.symbols[2].children[0].name, "start");
+		assert_eq!(idx.roots()[2].children.len(), 1);
+		assert_eq!(idx.roots()[2].children[0].name, "start");
 	}
 
 	#[test]
 	fn index_unclosed_function() {
 		let text = "Function unclosed\n  label1:";
 		let idx = index_document(text);
-		assert_eq!(idx.symbols.len(), 1);
-		assert_eq!(idx.symbols[0].name, "unclosed");
-		assert_eq!(idx.symbols[0].children.len(), 1);
+		assert_eq!(idx.roots().len(), 1);
+		assert_eq!(idx.roots()[0].name, "unclosed");
+		assert_eq!(idx.roots()[0].children.len(), 1);
 	}
 
 	#[test]
 	fn index_section_flag_e() {
 		let text = "Section /e \"Optional Section\"\nSectionEnd";
 		let idx = index_document(text);
-		assert_eq!(idx.symbols.len(), 1);
-		assert_eq!(idx.symbols[0].name, "Optional Section");
+		assert_eq!(idx.roots().len(), 1);
+		assert_eq!(idx.roots()[0].name, "Optional Section");
 	}
 
 	#[test]
 	fn selection_range_covers_name_only() {
 		let text = "Function myFunc\nFunctionEnd";
 		let idx = index_document(text);
-		let sel = idx.symbols[0].selection_range;
+		let sel = idx.roots()[0].selection_range;
 		assert_eq!(sel.start.character, 9); // "Function " = 9 chars
 		assert_eq!(sel.end.character, 15); // "myFunc" = 6 chars
 	}
@@ -714,7 +697,7 @@ SectionEnd
 	fn define_skips_flags() {
 		let text = "!define /date NOW";
 		let idx = index_document(text);
-		assert!(idx.symbols.is_empty() || idx.symbols[0].name != "/date");
+		assert!(idx.roots().is_empty() || idx.roots()[0].name != "/date");
 	}
 
 	#[test]
@@ -737,35 +720,72 @@ SectionEnd
 		assert_eq!(name, "Expanded");
 	}
 
-	// ── find_symbol_kind ──
+	// ── Looking a definition up ──
 
-	#[test]
-	fn find_symbol_kind_function() {
-		let idx = index_document("Function myFunc\nFunctionEnd");
-		assert_eq!(
-			find_symbol_kind(&idx, "myFunc"),
-			Some(NsisSymbolKind::Function)
-		);
+	/// The kind of the definition of `word`, for tests that only care about
+	/// which kind answered.
+	fn kind_of(idx: &DocumentIndex, word: &str) -> Option<NsisSymbolKind> {
+		idx.definition(word).map(|sym| sym.kind)
 	}
 
 	#[test]
-	fn find_symbol_kind_child_label() {
+	fn definition_of_a_function() {
+		let idx = index_document("Function myFunc\nFunctionEnd");
+		assert_eq!(kind_of(&idx, "myFunc"), Some(NsisSymbolKind::Function));
+	}
+
+	/// A label lives inside its container, but a lookup does not have to know
+	/// that.
+	#[test]
+	fn definition_of_a_nested_label() {
 		let idx = index_document("Function myFunc\n  start:\nFunctionEnd");
-		assert_eq!(find_symbol_kind(&idx, "start"), Some(NsisSymbolKind::Label));
+		assert_eq!(kind_of(&idx, "start"), Some(NsisSymbolKind::Label));
 	}
 
 	#[test]
-	fn find_symbol_kind_not_found() {
+	fn definition_of_an_undefined_name() {
 		let idx = index_document("Function myFunc\nFunctionEnd");
-		assert_eq!(find_symbol_kind(&idx, "missing"), None);
+		assert!(idx.definition("missing").is_none());
+	}
+
+	/// The user points at the sigil the name is *used* with; the definition is
+	/// recorded bare.
+	#[test]
+	fn definition_is_found_through_a_sigil() {
+		let idx = index_document("Var myVar");
+		assert_eq!(kind_of(&idx, "$myVar"), Some(NsisSymbolKind::Variable));
+		assert_eq!(kind_of(&idx, "myVar"), Some(NsisSymbolKind::Variable));
+
+		let idx = index_document("!macro MyMacro\n!macroend");
+		assert_eq!(kind_of(&idx, "!MyMacro"), Some(NsisSymbolKind::Macro));
 	}
 
 	#[test]
-	fn find_symbol_kind_with_dollar_prefix() {
-		let idx = index_document("Var myVar");
+	fn definition_ignores_case() {
+		let idx = index_document("Function myFunc\nFunctionEnd");
+		assert_eq!(idx.definition("MYFUNC").unwrap().name, "myFunc");
+	}
+
+	/// The same label name may be declared in more than one function, and a
+	/// rename has to rewrite every one of them.
+	#[test]
+	fn definitions_of_finds_every_declaration_of_a_kind() {
+		let idx =
+			index_document("Function a\n  done:\nFunctionEnd\nFunction b\n  done:\nFunctionEnd");
+		assert_eq!(idx.definitions_of("done", NsisSymbolKind::Label).count(), 2);
+	}
+
+	#[test]
+	fn definitions_of_is_filtered_by_kind() {
+		let idx = index_document("Var thing\n!define thing 1");
 		assert_eq!(
-			find_symbol_kind(&idx, "$myVar"),
-			Some(NsisSymbolKind::Variable)
+			idx.definitions_of("thing", NsisSymbolKind::Variable)
+				.count(),
+			1
+		);
+		assert_eq!(
+			idx.definitions_of("thing", NsisSymbolKind::Define).count(),
+			1
 		);
 	}
 
@@ -841,6 +861,55 @@ SectionEnd
 		let refs = find_references(text, "myFunc", NsisSymbolKind::Function);
 		assert_eq!(refs.len(), 1);
 		assert_eq!(refs[0].start.line, 1);
+	}
+
+	#[test]
+	fn refs_skips_trailing_line_comments() {
+		let text = "DetailPrint \"hi\" ; see ${APP_NAME} for details\nDetailPrint ${APP_NAME}";
+		let refs = find_references(text, "APP_NAME", NsisSymbolKind::Define);
+		assert_eq!(refs.len(), 1);
+		assert_eq!(refs[0].start.line, 1);
+	}
+
+	#[test]
+	fn refs_skips_trailing_comments_for_variables() {
+		let text = "DetailPrint $myVar # and $myVar again";
+		let refs = find_references(text, "myVar", NsisSymbolKind::Variable);
+		assert_eq!(refs.len(), 1);
+		assert_eq!(refs[0].start.character, 13);
+	}
+
+	#[test]
+	fn refs_skips_trailing_comments_for_labels() {
+		let text = "Goto done ; Goto done\nGoto done";
+		let refs = find_references(text, "done", NsisSymbolKind::Label);
+		assert_eq!(refs.len(), 2);
+		assert_eq!(refs[0].start.line, 0);
+		assert_eq!(refs[1].start.line, 1);
+	}
+
+	#[test]
+	fn refs_skips_inline_block_comments() {
+		let text = "DetailPrint /* ${APP_NAME} */ ${APP_NAME}";
+		let refs = find_references(text, "APP_NAME", NsisSymbolKind::Define);
+		assert_eq!(refs.len(), 1);
+		assert_eq!(refs[0].start.character, 32);
+	}
+
+	#[test]
+	fn refs_inside_a_string_still_count() {
+		let text = "DetailPrint \"${APP_NAME} installed\"";
+		let refs = find_references(text, "APP_NAME", NsisSymbolKind::Define);
+		assert_eq!(refs.len(), 1);
+	}
+
+	#[test]
+	fn refs_columns_are_utf16_after_multibyte_text() {
+		let text = "DetailPrint \"ü\" ${APP_NAME}";
+		let refs = find_references(text, "APP_NAME", NsisSymbolKind::Define);
+		assert_eq!(refs.len(), 1);
+		// "DetailPrint \"ü\" ${" is 18 UTF-16 units, 19 bytes.
+		assert_eq!(refs[0].start.character, 18);
 	}
 
 	#[test]

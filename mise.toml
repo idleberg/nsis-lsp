@@ -1,7 +1,14 @@
 [tools]
 bun = "latest"
-lefthook = "latest"
+hk = "latest"
+pkl = "latest"
 rust = "latest"
+
+[env]
+HK_MISE = 1
+
+[hooks]
+postinstall = "hk install --mise"
 
 [tasks.build]
 description = "Build the Rust formatter"
@@ -26,3 +33,7 @@ run = "cargo clippy -- --deny warnings"
 [tasks.test]
 description = "Run all tests"
 run = "cargo test"
+
+[tasks.install]
+description = "Install to PATH"
+run = "cargo install --path ."

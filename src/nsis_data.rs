@@ -1,3 +1,11 @@
+//! What NSIS itself defines: the commands in the reference manual, the built-in
+//! variables, the flag constants, and the commands that are still accepted but
+//! no longer documented.
+//!
+//! The four tables are private. Callers ask one question — [`lookup`] — and get
+//! back a [`Known`] saying which table answered, so no caller has to know there
+//! is more than one, or which order they are searched in.
+
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
@@ -10,7 +18,7 @@ pub struct DocEntry {
 
 const DOCS_RAW: &str = include_str!("./llms-full.txt");
 
-pub static DOCS: LazyLock<HashMap<String, DocEntry>> = LazyLock::new(|| {
+static DOCS: LazyLock<HashMap<String, DocEntry>> = LazyLock::new(|| {
 	let mut map = HashMap::new();
 
 	let start = match DOCS_RAW.find("\n# ") {
@@ -86,7 +94,93 @@ pub static DOCS: LazyLock<HashMap<String, DocEntry>> = LazyLock::new(|| {
 	map
 });
 
-pub fn lookup_doc(word: &str) -> Option<&'static DocEntry> {
+/// What NSIS knows a word to be.
+///
+/// The variants are ordered the way [`lookup`] searches: a documented command
+/// wins over a variable of the same name, and a deprecated command is only
+/// reported when nothing documented matches.
+pub enum Known {
+	/// A command or preprocessor keyword from the reference manual.
+	Command(&'static DocEntry),
+	/// A built-in variable, with its `$`.
+	Variable {
+		name: &'static str,
+		description: &'static str,
+	},
+	/// A flag, registry-root or dialog constant.
+	Constant {
+		name: &'static str,
+		description: &'static str,
+	},
+	/// A command NSIS no longer documents.
+	Deprecated(&'static Deprecated),
+}
+
+/// A command NSIS no longer documents, and what can be said in its place.
+pub struct Deprecated {
+	pub name: &'static str,
+	pub replacement: Replacement,
+}
+
+/// What NSIS offers instead of a deprecated command.
+///
+/// The three variants are three different situations, not three shades of one:
+/// only a [`Swap`](Replacement::Swap) can be applied as a quickfix, because
+/// only a `Swap` names a command that means the same thing.
+pub enum Replacement {
+	/// A modern command that does the same job — safe to substitute verbatim.
+	Swap(&'static str),
+	/// No drop-in exists, but there is something worth telling the user. A full
+	/// sentence, rendered after the deprecation notice.
+	Advice(&'static str),
+	/// The command is gone and nothing takes its place.
+	None,
+}
+
+impl Known {
+	/// The canonical spelling, whatever the caller wrote.
+	pub fn name(&self) -> &'static str {
+		match self {
+			Known::Command(entry) => &entry.name,
+			Known::Variable { name, .. } | Known::Constant { name, .. } => name,
+			Known::Deprecated(dep) => dep.name,
+		}
+	}
+}
+
+/// What NSIS defines `word` to be, or `None` if it defines nothing by that
+/// name.
+///
+/// Matching is case-insensitive throughout. A word without a `!` still finds
+/// the preprocessor keyword — the client asks about `include` while the user is
+/// still typing `!include` — and a variable is found with or without its `$`.
+pub fn lookup(word: &str) -> Option<Known> {
+	if let Some(entry) = lookup_doc(word) {
+		return Some(Known::Command(entry));
+	}
+
+	let bare = word.trim_start_matches('$');
+	for (name, description) in BUILTIN_VARIABLES {
+		if name.trim_start_matches('$').eq_ignore_ascii_case(bare)
+			|| name.eq_ignore_ascii_case(word)
+		{
+			return Some(Known::Variable { name, description });
+		}
+	}
+
+	for (name, description) in CONSTANTS {
+		if name.eq_ignore_ascii_case(word) {
+			return Some(Known::Constant { name, description });
+		}
+	}
+
+	DEPRECATED_COMMANDS
+		.iter()
+		.find(|dep| dep.name.eq_ignore_ascii_case(word))
+		.map(Known::Deprecated)
+}
+
+fn lookup_doc(word: &str) -> Option<&'static DocEntry> {
 	let key = word.to_lowercase();
 	DOCS.get(&key).or_else(|| {
 		if !key.starts_with('!') {
@@ -97,7 +191,33 @@ pub fn lookup_doc(word: &str) -> Option<&'static DocEntry> {
 	})
 }
 
-pub const BUILTIN_VARIABLES: &[(&str, &str)] = &[
+/// Every documented command, in no particular order.
+pub fn commands() -> impl Iterator<Item = &'static DocEntry> {
+	DOCS.values()
+}
+
+/// Every built-in variable, as `($NAME, description)`.
+pub fn variables() -> impl Iterator<Item = (&'static str, &'static str)> {
+	BUILTIN_VARIABLES.iter().copied()
+}
+
+/// Every constant, as `(NAME, description)`.
+pub fn constants() -> impl Iterator<Item = (&'static str, &'static str)> {
+	CONSTANTS.iter().copied()
+}
+
+/// Every deprecated command, in no particular order.
+///
+/// Unlike the other three tables, nothing in the server walks this one at
+/// runtime — a deprecated command is never offered as a completion. It is here
+/// so the tests that guard the table can be written as loops over it, and can
+/// therefore never fall behind an entry added later.
+#[cfg(test)]
+pub fn deprecated() -> impl Iterator<Item = &'static Deprecated> {
+	DEPRECATED_COMMANDS.iter()
+}
+
+const BUILTIN_VARIABLES: &[(&str, &str)] = &[
 	("$INSTDIR", "The installation directory"),
 	(
 		"$OUTDIR",
@@ -172,25 +292,76 @@ pub const BUILTIN_VARIABLES: &[(&str, &str)] = &[
 	("$R9", "User variable $R9"),
 ];
 
-pub const DEPRECATED_COMMANDS: &[&str] = &[
-	"CompareDLLVersions",
-	"CompareFileTimes",
-	"DirShow",
-	"DisabledBitmap",
-	"EnabledBitmap",
-	"GetFullDLLPath",
-	"GetParent",
-	"GetWinampInstPath",
-	"LangStringUP",
-	"PackEXEHeader",
-	"SectionDivider",
-	"SetPluginUnload",
-	"SubSection",
-	"SubSectionEnd",
-	"UninstallExeName",
+/// Commands NSIS no longer documents.
+///
+/// The `Swap` targets and the `Advice` wording come from `makensis -CMDHELP` on
+/// NSIS 3.12: a `Swap` is one the compiler still accepts and that means the same
+/// thing, `Advice` is one it accepts but that no longer does anything useful,
+/// and `None` is one it rejects outright.
+const DEPRECATED_COMMANDS: &[Deprecated] = &[
+	Deprecated {
+		name: "CompareDLLVersions",
+		replacement: Replacement::None,
+	},
+	Deprecated {
+		name: "CompareFileTimes",
+		replacement: Replacement::None,
+	},
+	Deprecated {
+		name: "DirShow",
+		replacement: Replacement::Advice("It does not currently work."),
+	},
+	Deprecated {
+		name: "DisabledBitmap",
+		replacement: Replacement::None,
+	},
+	Deprecated {
+		name: "EnabledBitmap",
+		replacement: Replacement::None,
+	},
+	Deprecated {
+		name: "GetFullDLLPath",
+		replacement: Replacement::None,
+	},
+	Deprecated {
+		name: "GetParent",
+		replacement: Replacement::Advice("Use the ${GetParent} macro from FileFunc.nsh instead."),
+	},
+	Deprecated {
+		name: "GetWinampInstPath",
+		replacement: Replacement::None,
+	},
+	Deprecated {
+		name: "LangStringUP",
+		replacement: Replacement::Swap("LangString"),
+	},
+	Deprecated {
+		name: "PackEXEHeader",
+		replacement: Replacement::None,
+	},
+	Deprecated {
+		name: "SectionDivider",
+		replacement: Replacement::None,
+	},
+	Deprecated {
+		name: "SetPluginUnload",
+		replacement: Replacement::Advice("Plug-ins should handle unloading on their own."),
+	},
+	Deprecated {
+		name: "SubSection",
+		replacement: Replacement::Swap("SectionGroup"),
+	},
+	Deprecated {
+		name: "SubSectionEnd",
+		replacement: Replacement::Swap("SectionGroupEnd"),
+	},
+	Deprecated {
+		name: "UninstallExeName",
+		replacement: Replacement::Advice("Use WriteUninstaller from a section instead."),
+	},
 ];
 
-pub const CONSTANTS: &[(&str, &str)] = &[
+const CONSTANTS: &[(&str, &str)] = &[
 	("MB_OK", "OK button only"),
 	("MB_OKCANCEL", "OK and Cancel buttons"),
 	("MB_ABORTRETRYIGNORE", "Abort, Retry, and Ignore buttons"),
@@ -266,57 +437,103 @@ pub const CONSTANTS: &[(&str, &str)] = &[
 mod tests {
 	use super::*;
 
+	/// The variant that answered, for assertions that only care about which
+	/// table a word came from.
+	fn kind_of(word: &str) -> Option<&'static str> {
+		Some(match lookup(word)? {
+			Known::Command(_) => "command",
+			Known::Variable { .. } => "variable",
+			Known::Constant { .. } => "constant",
+			Known::Deprecated(_) => "deprecated",
+		})
+	}
+
 	#[test]
 	fn docs_parses_entries() {
-		assert!(!DOCS.is_empty(), "DOCS should contain parsed entries");
+		assert!(commands().next().is_some(), "no doc entries were parsed");
 	}
 
 	#[test]
-	fn lookup_doc_exact_command() {
-		let entry = lookup_doc("Name");
-		assert!(entry.is_some(), "should find 'Name' command");
+	fn a_command_is_found_by_name() {
+		assert_eq!(kind_of("Name"), Some("command"));
+		assert_eq!(lookup("Name").unwrap().name(), "Name");
 	}
 
 	#[test]
-	fn lookup_doc_case_insensitive() {
-		let entry = lookup_doc("name");
-		assert!(entry.is_some(), "lookup should be case-insensitive");
+	fn lookup_is_case_insensitive() {
+		assert_eq!(lookup("name").unwrap().name(), "Name");
+		assert_eq!(lookup("instdir").unwrap().name(), "$INSTDIR");
+		assert_eq!(lookup("mb_ok").unwrap().name(), "MB_OK");
+		assert_eq!(lookup("dirshow").unwrap().name(), "DirShow");
+	}
+
+	/// The client asks about `include` while the user is still typing
+	/// `!include`.
+	#[test]
+	fn a_preprocessor_keyword_is_found_without_its_bang() {
+		assert_eq!(lookup("include").unwrap().name(), "!include");
 	}
 
 	#[test]
-	fn lookup_doc_bang_prefix_fallback() {
-		let entry = lookup_doc("include");
-		assert!(
-			entry.is_some(),
-			"should find '!include' when given 'include'"
-		);
-		assert!(entry.unwrap().name.starts_with('!'));
+	fn a_variable_is_found_with_or_without_its_dollar() {
+		assert_eq!(lookup("$INSTDIR").unwrap().name(), "$INSTDIR");
+		assert_eq!(lookup("INSTDIR").unwrap().name(), "$INSTDIR");
 	}
 
 	#[test]
-	fn lookup_doc_nonexistent() {
-		assert!(lookup_doc("__nonexistent_command__").is_none());
+	fn a_deprecated_command_reports_its_canonical_spelling() {
+		assert_eq!(kind_of("subsection"), Some("deprecated"));
+		assert_eq!(lookup("subsection").unwrap().name(), "SubSection");
 	}
 
 	#[test]
-	fn builtin_variables_not_empty() {
-		assert!(!BUILTIN_VARIABLES.is_empty());
+	fn an_unknown_word_is_unknown() {
+		assert!(lookup("__nonexistent_command__").is_none());
+	}
+
+	/// `lookup` answers with the first table that matches, so a deprecated
+	/// command that also appeared in the reference manual would come back as a
+	/// `Command` — and the deprecation warning would silently stop firing.
+	#[test]
+	fn no_deprecated_command_is_also_documented() {
+		for dep in deprecated() {
+			assert_eq!(
+				kind_of(dep.name),
+				Some("deprecated"),
+				"{} is shadowed by another table",
+				dep.name
+			);
+		}
+	}
+
+	/// Every command a `Swap` points at has to be one the reference manual
+	/// documents, or the quickfix would trade a deprecated command for a
+	/// nonexistent one.
+	#[test]
+	fn every_swap_target_is_a_documented_command() {
+		for dep in deprecated() {
+			let Replacement::Swap(target) = dep.replacement else {
+				continue;
+			};
+			assert_eq!(
+				kind_of(target),
+				Some("command"),
+				"{} points at {target}, which is not a documented command",
+				dep.name
+			);
+		}
 	}
 
 	#[test]
 	fn builtin_variables_start_with_dollar() {
-		for (var, _) in BUILTIN_VARIABLES {
+		for (var, _) in variables() {
 			assert!(var.starts_with('$'), "{var} should start with $");
 		}
 	}
 
 	#[test]
-	fn constants_not_empty() {
-		assert!(!CONSTANTS.is_empty());
-	}
-
-	#[test]
-	fn deprecated_commands_not_empty() {
-		assert!(!DEPRECATED_COMMANDS.is_empty());
+	fn the_tables_are_populated() {
+		assert!(variables().next().is_some());
+		assert!(constants().next().is_some());
 	}
 }
