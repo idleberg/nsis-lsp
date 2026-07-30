@@ -57,7 +57,9 @@ fn is_builtin(word: &str) -> bool {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::testing::{A_URI, B_URI, position_params, rename_params, two_documents, uri};
+	use crate::testing::{
+		A_URI, B_URI, position_params, rename_params, two_documents, uri, workspace_with,
+	};
 
 	/// Every open document is edited, each under the `Uri` it was opened with.
 	#[test]
@@ -106,6 +108,16 @@ mod tests {
 			}
 			other => panic!("unexpected prepare rename response: {other:?}"),
 		}
+	}
+
+	/// A declared name spelled out in prose is still prose: rewriting it would
+	/// edit the text the installer shows.
+	#[test]
+	fn rename_leaves_a_word_in_a_string_alone() {
+		let workspace = workspace_with(&[(A_URI, "Var myVar\nDetailPrint \"about myVar\"")]);
+
+		assert!(handle_prepare_rename(&workspace, position_params(A_URI, 1, 21)).is_none());
+		assert!(handle_rename(&workspace, rename_params(A_URI, 1, 21, "other")).is_none());
 	}
 
 	#[test]

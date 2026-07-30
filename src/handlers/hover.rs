@@ -45,6 +45,7 @@ fn hover_for_word(word: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::testing::{TEST_URI, position_params, workspace_with};
 
 	#[test]
 	fn hover_builtin_variable() {
@@ -76,5 +77,37 @@ mod tests {
 	#[test]
 	fn hover_unknown() {
 		assert!(hover_for_word("__nonexistent__").is_none());
+	}
+
+	// ── handle_hover ──
+
+	fn hover_at(text: &str, line: u32, character: u32) -> Option<Hover> {
+		let workspace = workspace_with(&[(TEST_URI, text)]);
+		handle_hover(
+			&workspace,
+			HoverParams {
+				text_document_position_params: position_params(TEST_URI, line, character),
+				work_done_progress_params: Default::default(),
+			},
+		)
+	}
+
+	#[test]
+	fn hover_on_an_instruction() {
+		assert!(hover_at("Name \"Installer\"", 0, 2).is_some());
+	}
+
+	/// The same word inside a string is the installer's prose, and NSIS's
+	/// documentation for it would be nonsense there.
+	#[test]
+	fn hover_in_a_string_is_none() {
+		assert!(hover_at("DetailPrint \"What's your Name\"", 0, 26).is_none());
+	}
+
+	/// What does expand inside a string still hovers.
+	#[test]
+	fn hover_on_a_variable_in_a_string() {
+		let hover = hover_at("DetailPrint \"into $INSTDIR\"", 0, 22);
+		assert!(hover.is_some());
 	}
 }

@@ -52,9 +52,9 @@ impl Document {
 		}
 	}
 
-	/// The identifier under `pos`. `None` in a comment, past the end of the
-	/// line, or where there is no identifier at all — a lone sigil with no name
-	/// after it is not one.
+	/// The identifier under `pos`. `None` in a comment, in the prose of a quoted
+	/// string, past the end of the line, or where there is no identifier at all —
+	/// a lone sigil with no name after it is not one.
 	pub fn identifier_at(&self, pos: Position) -> Option<Identifier> {
 		let line_str = line_at(&self.text, pos.line)?;
 		let col = utf16_to_byte_offset(line_str, pos.character);
@@ -62,7 +62,8 @@ impl Document {
 			return None;
 		}
 
-		if context::context_at(&self.text, pos.line, col) == SyntaxContext::Comment {
+		let syntax = context::context_at(&self.text, pos.line, col);
+		if syntax == SyntaxContext::Comment {
 			return None;
 		}
 
@@ -82,6 +83,15 @@ impl Document {
 		}
 
 		let bare_start = start;
+
+		// A string is prose with holes in it: only `$VAR`, `${DEFINE}` and
+		// `$(LangString)` are script, so a word without a `$` in front of it is
+		// something the user wrote for the installer to say, not a name the
+		// server knows anything about.
+		if syntax == SyntaxContext::String && !is_interpolation(bytes, bare_start) {
+			return None;
+		}
+
 		if start > 0 && (bytes[start - 1] == b'!' || bytes[start - 1] == b'$') {
 			start -= 1;
 		}
@@ -106,6 +116,17 @@ impl Document {
 			let last_col = lines.last().map_or(0, |l| byte_to_utf16_offset(l, l.len()));
 			Position::new(last_line, last_col)
 		}
+	}
+}
+
+/// Whether the name starting at `start` is expanded rather than printed: a `$`
+/// directly in front of it, or one through the `{` or `(` that opens a deref.
+fn is_interpolation(bytes: &[u8], start: usize) -> bool {
+	match start {
+		0 => false,
+		_ if bytes[start - 1] == b'$' => true,
+		1 => false,
+		_ => matches!(bytes[start - 1], b'{' | b'(') && bytes[start - 2] == b'$',
 	}
 }
 
@@ -324,6 +345,43 @@ mod tests {
 	fn identifier_at_in_comment_is_none() {
 		let doc = document("# DetailPrint hello");
 		assert!(doc.identifier_at(Position::new(0, 5)).is_none());
+	}
+
+	/// The text of a string is what the installer says, not script: a word in it
+	/// that happens to spell a command is prose.
+	#[test]
+	fn identifier_at_in_string_prose_is_none() {
+		let doc = document("DetailPrint \"What's your Name\"");
+		assert!(doc.identifier_at(Position::new(0, 26)).is_none());
+	}
+
+	/// The holes in a string are script, though — everything that expands is
+	/// still an identifier there.
+	#[test]
+	fn identifier_at_in_string_reads_an_interpolation() {
+		let doc = document("DetailPrint \"in $INSTDIR\"");
+		assert_eq!(text_at(&doc, Position::new(0, 20)), Some("$INSTDIR".into()));
+
+		let doc = document("DetailPrint \"of ${APP_NAME}\"");
+		assert_eq!(text_at(&doc, Position::new(0, 20)), Some("APP_NAME".into()));
+
+		let doc = document("DetailPrint \"say $(MY_TEXT)\"");
+		assert_eq!(text_at(&doc, Position::new(0, 20)), Some("MY_TEXT".into()));
+	}
+
+	/// A brace that no `$` opened is punctuation in the middle of prose.
+	#[test]
+	fn identifier_at_in_string_needs_the_dollar_before_the_brace() {
+		let doc = document("DetailPrint \"a {Name} b\"");
+		assert!(doc.identifier_at(Position::new(0, 17)).is_none());
+	}
+
+	/// The gate is the string, not the quote: the same word after it is code
+	/// again.
+	#[test]
+	fn identifier_at_after_a_string_is_read_again() {
+		let doc = document("!insertmacro \"foo\" Name");
+		assert_eq!(text_at(&doc, Position::new(0, 21)), Some("Name".into()));
 	}
 
 	/// A cursor touching the end of a word still reads that word; only one with

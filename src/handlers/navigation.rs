@@ -90,6 +90,14 @@ mod tests {
 		}
 	}
 
+	/// A name mentioned in the text of a string is not a use of it, so there is
+	/// nowhere to go from there.
+	#[test]
+	fn goto_definition_from_a_string_is_none() {
+		let workspace = workspace_with(&[(A_URI, "Var myVar\nDetailPrint \"about myVar\"")]);
+		assert!(handle_goto_definition(&workspace, definition_params(A_URI, 1, 21)).is_none());
+	}
+
 	#[test]
 	fn references_span_every_open_document() {
 		let locations =
