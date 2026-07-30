@@ -1,7 +1,14 @@
 [tools]
 bun = "latest"
-lefthook = "latest"
+hk = "latest"
+pkl = "latest"
 rust = "latest"
+
+[env]
+HK_MISE = 1
+
+[hooks]
+postinstall = "hk install --mise"
 
 [tasks.build]
 description = "Build the Rust formatter"
