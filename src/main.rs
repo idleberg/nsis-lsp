@@ -1,4 +1,5 @@
 mod cli;
+mod client;
 mod compiler;
 mod context;
 mod diagnostics;
@@ -12,21 +13,19 @@ use std::sync::LazyLock;
 
 use ardent::{EndOfLine, Formatter, FormatterOptions};
 use clap::Parser;
-use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
+use lsp_server::{Connection, Message, Notification, Request};
 use lsp_types::{
 	CodeAction, CodeActionKind, CodeActionParams, CodeActionProviderCapability, CodeActionResponse,
 	CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
 	CompletionTextEdit, Diagnostic, DiagnosticSeverity, DocumentFormattingParams, DocumentSymbol,
 	DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
-	Hover, HoverContents, HoverParams, HoverProviderCapability, Location, LogMessageParams,
-	MarkupContent, MarkupKind, MessageType, OneOf, ParameterInformation, ParameterLabel, Position,
-	PrepareRenameResponse, PublishDiagnosticsParams, Range, ReferenceParams, RenameOptions,
-	RenameParams, ServerCapabilities, ShowMessageParams, SignatureHelp, SignatureHelpOptions,
-	SignatureHelpParams, SignatureInformation, TextDocumentSyncCapability, TextDocumentSyncKind,
-	TextEdit, WorkspaceEdit,
+	Hover, HoverContents, HoverParams, HoverProviderCapability, Location, MarkupContent,
+	MarkupKind, MessageType, OneOf, ParameterInformation, ParameterLabel, Position,
+	PrepareRenameResponse, Range, ReferenceParams, RenameOptions, RenameParams, ServerCapabilities,
+	SignatureHelp, SignatureHelpOptions, SignatureHelpParams, SignatureInformation,
+	TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, WorkspaceEdit,
 	notification::{
 		DidChangeConfiguration, DidChangeTextDocument, DidOpenTextDocument, DidSaveTextDocument,
-		LogMessage, Notification as _, PublishDiagnostics, ShowMessage,
 	},
 	request::{
 		CodeActionRequest, Completion, DocumentSymbolRequest, Formatting, GotoDefinition,
@@ -36,6 +35,7 @@ use lsp_types::{
 use serde::Deserialize;
 
 use cli::Cli;
+use client::{Client, Stdio};
 use compiler::PreprocessMode;
 use context::SyntaxContext;
 use position::{byte_to_utf16_offset, is_ident_char, line_at, utf16_to_byte_offset};
@@ -197,26 +197,13 @@ fn main() {
 		.unwrap_or_default();
 
 	let mut state = LspState::from_options(options);
+	let client = Stdio::new(&connection);
 
-	log_message(
-		&connection,
+	client.log(
 		MessageType::INFO,
 		&format!("nsis-lsp v{} initialized", env!("CARGO_PKG_VERSION")),
 	);
-
-	if let Some(ref path) = state.makensis_path {
-		log_message(
-			&connection,
-			MessageType::INFO,
-			&format!("Using makensis: {path}"),
-		);
-	} else {
-		log_message(
-			&connection,
-			MessageType::WARNING,
-			"makensis not found — diagnostics unavailable",
-		);
-	}
+	log_makensis_path(&client, state.makensis_path.as_deref());
 
 	let mut workspace = Workspace::new();
 
@@ -226,10 +213,10 @@ fn main() {
 				if connection.handle_shutdown(&req).unwrap_or(true) {
 					break;
 				}
-				handle_request(&connection, req, &workspace, &state);
+				handle_request(&client, req, &workspace, &state);
 			}
 			Message::Notification(not) => {
-				handle_notification(&connection, not, &mut workspace, &mut state);
+				handle_notification(&client, not, &mut workspace, &mut state);
 			}
 			Message::Response(_) => {}
 		}
@@ -241,69 +228,69 @@ fn main() {
 	io_threads.join().ok();
 }
 
-fn handle_request(connection: &Connection, req: Request, workspace: &Workspace, state: &LspState) {
+fn handle_request(client: &impl Client, req: Request, workspace: &Workspace, state: &LspState) {
 	match req.method.as_str() {
 		Formatting::METHOD => {
 			if let Ok((id, params)) = req.extract::<DocumentFormattingParams>(Formatting::METHOD) {
 				match handle_formatting(workspace, params, state) {
-					Ok(edits) => send_response(connection, id, edits),
+					Ok(edits) => client.respond(id, edits),
 					Err((uri, msg)) => {
-						publish_format_error(connection, uri, &msg);
-						show_message(connection, MessageType::ERROR, &msg);
-						send_response(connection, id, Vec::<TextEdit>::new());
+						publish_format_error(client, uri, &msg);
+						client.show_message(MessageType::ERROR, &msg);
+						client.respond(id, Vec::<TextEdit>::new());
 					}
 				}
 			}
 		}
 		HoverRequest::METHOD => {
 			if let Ok((id, params)) = req.extract::<HoverParams>(HoverRequest::METHOD) {
-				send_response(connection, id, handle_hover(workspace, params));
+				client.respond(id, handle_hover(workspace, params));
 			}
 		}
 		Completion::METHOD => {
 			if let Ok((id, params)) = req.extract::<CompletionParams>(Completion::METHOD) {
-				send_response(connection, id, handle_completion(workspace, params));
+				client.respond(id, handle_completion(workspace, params));
 			}
 		}
 		GotoDefinition::METHOD => {
 			if let Ok((id, params)) = req.extract::<GotoDefinitionParams>(GotoDefinition::METHOD) {
-				send_response(connection, id, handle_goto_definition(workspace, params));
+				client.respond(id, handle_goto_definition(workspace, params));
 			}
 		}
 		DocumentSymbolRequest::METHOD => {
 			if let Ok((id, params)) =
 				req.extract::<DocumentSymbolParams>(DocumentSymbolRequest::METHOD)
 			{
-				send_response(connection, id, handle_document_symbols(workspace, params));
+				client.respond(id, handle_document_symbols(workspace, params));
 			}
 		}
 		References::METHOD => {
 			if let Ok((id, params)) = req.extract::<ReferenceParams>(References::METHOD) {
-				send_response(connection, id, handle_references(workspace, params));
+				client.respond(id, handle_references(workspace, params));
 			}
 		}
 		PrepareRenameRequest::METHOD => {
 			if let Ok((id, params)) =
 				req.extract::<lsp_types::TextDocumentPositionParams>(PrepareRenameRequest::METHOD)
 			{
-				send_response(connection, id, handle_prepare_rename(workspace, params));
+				client.respond(id, handle_prepare_rename(workspace, params));
 			}
 		}
 		Rename::METHOD => {
 			if let Ok((id, params)) = req.extract::<RenameParams>(Rename::METHOD) {
-				send_response(connection, id, handle_rename(workspace, params));
+				client.respond(id, handle_rename(workspace, params));
 			}
 		}
 		SignatureHelpRequest::METHOD => {
 			if let Ok((id, params)) =
 				req.extract::<SignatureHelpParams>(SignatureHelpRequest::METHOD)
 			{
-				send_response(connection, id, handle_signature_help(workspace, params));
+				client.respond(id, handle_signature_help(workspace, params));
 			}
 		}
 		CodeActionRequest::METHOD => {
 			if let Ok((id, params)) = req.extract::<CodeActionParams>(CodeActionRequest::METHOD) {
-				send_response(connection, id, handle_code_actions(params));
+				client.respond(id, handle_code_actions(params));
 			}
 		}
 		_ => {}
@@ -311,29 +298,29 @@ fn handle_request(connection: &Connection, req: Request, workspace: &Workspace, 
 }
 
 fn handle_notification(
-	connection: &Connection,
+	client: &impl Client,
 	not: Notification,
 	workspace: &mut Workspace,
 	state: &mut LspState,
 ) {
 	if let Some(params) = cast_notification::<DidChangeConfiguration>(not.clone()) {
-		handle_configuration_change(connection, params.settings, state);
+		handle_configuration_change(client, params.settings, state);
 	} else if let Some(params) = cast_notification::<DidOpenTextDocument>(not.clone()) {
 		let uri = params.text_document.uri;
 		let text = params.text_document.text;
-		publish_diagnostics(connection, uri.clone(), &text);
+		publish_diagnostics(client, uri.clone(), &text);
 		workspace.open(uri, text);
 	} else if let Some(params) = cast_notification::<DidChangeTextDocument>(not.clone())
 		&& let Some(change) = params.content_changes.into_iter().last()
 	{
 		let uri = params.text_document.uri;
-		publish_diagnostics(connection, uri.clone(), &change.text);
+		publish_diagnostics(client, uri.clone(), &change.text);
 		workspace.open(uri, change.text);
 	} else if let Some(params) = cast_notification::<DidSaveTextDocument>(not)
 		&& state.diagnostics_on_save
 		&& let Some(doc) = workspace.document(&params.text_document.uri)
 	{
-		run_compiler_diagnostics(connection, state, &doc.uri, &doc.text);
+		run_compiler_diagnostics(client, state, &doc.uri, &doc.text);
 	}
 }
 
@@ -365,7 +352,7 @@ fn parse_settings(settings: serde_json::Value) -> SettingsUpdate {
 }
 
 fn handle_configuration_change(
-	connection: &Connection,
+	client: &impl Client,
 	settings: serde_json::Value,
 	state: &mut LspState,
 ) {
@@ -373,8 +360,7 @@ fn handle_configuration_change(
 		SettingsUpdate::Replace(options) => options,
 		SettingsUpdate::Unavailable => return,
 		SettingsUpdate::Unparseable => {
-			log_message(
-				connection,
+			client.log(
 				MessageType::WARNING,
 				"Ignoring workspace/didChangeConfiguration: settings could not be parsed",
 			);
@@ -385,26 +371,26 @@ fn handle_configuration_change(
 	let previous_makensis = state.makensis_path.clone();
 	*state = LspState::from_options(options);
 
-	log_message(connection, MessageType::INFO, "Configuration reloaded");
+	client.log(MessageType::INFO, "Configuration reloaded");
 
 	if state.makensis_path != previous_makensis {
-		match &state.makensis_path {
-			Some(path) => log_message(
-				connection,
-				MessageType::INFO,
-				&format!("Using makensis: {path}"),
-			),
-			None => log_message(
-				connection,
-				MessageType::WARNING,
-				"makensis not found — diagnostics unavailable",
-			),
-		}
+		log_makensis_path(client, state.makensis_path.as_deref());
+	}
+}
+
+/// Tell the client which compiler the server found, or that it found none.
+fn log_makensis_path(client: &impl Client, path: Option<&str>) {
+	match path {
+		Some(path) => client.log(MessageType::INFO, &format!("Using makensis: {path}")),
+		None => client.log(
+			MessageType::WARNING,
+			"makensis not found — diagnostics unavailable",
+		),
 	}
 }
 
 fn run_compiler_diagnostics(
-	connection: &Connection,
+	client: &impl Client,
 	state: &LspState,
 	uri: &lsp_types::Uri,
 	text: &str,
@@ -429,7 +415,7 @@ fn run_compiler_diagnostics(
 		all_diagnostics.push(diag);
 	}
 
-	send_diagnostics(connection, uri.clone(), all_diagnostics);
+	client.publish_diagnostics(uri.clone(), all_diagnostics);
 }
 
 // ── Formatting ──
@@ -642,48 +628,10 @@ fn truncate(s: &str, max: usize) -> String {
 
 // ── Diagnostics ──
 
-fn send_diagnostics(connection: &Connection, uri: lsp_types::Uri, diagnostics: Vec<Diagnostic>) {
-	let params = PublishDiagnosticsParams {
-		uri,
-		diagnostics,
-		version: None,
-	};
-	let not = Notification::new(
-		PublishDiagnostics::METHOD.to_string(),
-		serde_json::to_value(params).unwrap(),
-	);
-	connection.sender.send(Message::Notification(not)).ok();
-}
-
-fn log_message(connection: &Connection, typ: MessageType, msg: &str) {
-	let params = LogMessageParams {
-		typ,
-		message: msg.to_string(),
-	};
-	let not = Notification::new(
-		LogMessage::METHOD.to_string(),
-		serde_json::to_value(params).unwrap(),
-	);
-	connection.sender.send(Message::Notification(not)).ok();
-}
-
-fn show_message(connection: &Connection, typ: MessageType, msg: &str) {
-	let params = ShowMessageParams {
-		typ,
-		message: msg.to_string(),
-	};
-	let not = Notification::new(
-		ShowMessage::METHOD.to_string(),
-		serde_json::to_value(params).unwrap(),
-	);
-	connection.sender.send(Message::Notification(not)).ok();
-}
-
-fn publish_format_error(connection: &Connection, uri: lsp_types::Uri, msg: &str) {
+fn publish_format_error(client: &impl Client, uri: lsp_types::Uri, msg: &str) {
 	let (line, col) = parse_error_position(msg).unwrap_or((0, 0));
 	let pos = Position::new(line, col);
-	send_diagnostics(
-		connection,
+	client.publish_diagnostics(
 		uri,
 		vec![Diagnostic {
 			range: Range::new(pos, pos),
@@ -708,8 +656,8 @@ fn parse_error_position(msg: &str) -> Option<(u32, u32)> {
 	Some((line.saturating_sub(1), col.saturating_sub(1)))
 }
 
-fn publish_diagnostics(connection: &Connection, uri: lsp_types::Uri, text: &str) {
-	send_diagnostics(connection, uri, compute_diagnostics(text));
+fn publish_diagnostics(client: &impl Client, uri: lsp_types::Uri, text: &str) {
+	client.publish_diagnostics(uri, compute_diagnostics(text));
 }
 
 fn compute_diagnostics(text: &str) -> Vec<Diagnostic> {
@@ -1172,11 +1120,6 @@ fn handle_code_actions(params: CodeActionParams) -> Option<CodeActionResponse> {
 
 fn is_in_comment(text: &str, line: u32, col: usize) -> bool {
 	context::context_at(text, line, col) == SyntaxContext::Comment
-}
-
-fn send_response(connection: &Connection, id: RequestId, result: impl serde::Serialize) {
-	let resp = Response::new_ok(id, result);
-	connection.sender.send(Message::Response(resp)).ok();
 }
 
 fn uri_to_file_path(uri_str: &str) -> Option<String> {
@@ -1797,5 +1740,200 @@ mod tests {
 		assert_eq!(state.print_width, 90);
 		assert!(!state.trim_empty_lines);
 		assert!(state.single_quote);
+	}
+
+	// ── The message loop, through a recording client ──
+
+	use client::Recorder;
+	use lsp_types::notification::Notification as _;
+
+	/// A server that has found no compiler, so nothing shells out during a test.
+	fn quiet_state() -> LspState {
+		let mut state = LspState::from_options(InitOptions::default());
+		state.makensis_path = None;
+		state
+	}
+
+	fn did_open(uri_str: &str, text: &str) -> Notification {
+		Notification::new(
+			DidOpenTextDocument::METHOD.to_string(),
+			json!({
+				"textDocument": {
+					"uri": uri_str,
+					"languageId": "nsis",
+					"version": 1,
+					"text": text,
+				},
+			}),
+		)
+	}
+
+	fn did_change(uri_str: &str, text: &str) -> Notification {
+		Notification::new(
+			DidChangeTextDocument::METHOD.to_string(),
+			json!({
+				"textDocument": { "uri": uri_str, "version": 2 },
+				"contentChanges": [{ "text": text }],
+			}),
+		)
+	}
+
+	fn configuration_change(settings: serde_json::Value) -> Notification {
+		Notification::new(
+			DidChangeConfiguration::METHOD.to_string(),
+			json!({ "settings": settings }),
+		)
+	}
+
+	#[test]
+	fn opening_a_document_indexes_it_and_publishes_diagnostics() {
+		let client = Recorder::new();
+		let mut workspace = Workspace::new();
+
+		handle_notification(
+			&client,
+			did_open(TEST_URI, "Function myFunc\nFunctionEnd"),
+			&mut workspace,
+			&mut quiet_state(),
+		);
+
+		let doc = workspace.document(&uri(TEST_URI)).unwrap();
+		assert_eq!(doc.index.symbols.len(), 1);
+
+		let published = client.diagnostics();
+		assert_eq!(published.len(), 1);
+		assert_eq!(published[0].uri, uri(TEST_URI));
+	}
+
+	/// A change carries the whole document, so the diagnostics that go with it
+	/// are computed from the new text, not the text on disk.
+	#[test]
+	fn changing_a_document_republishes_diagnostics_for_the_new_text() {
+		let client = Recorder::new();
+		let mut workspace = Workspace::new();
+		let mut state = quiet_state();
+
+		handle_notification(
+			&client,
+			did_open(TEST_URI, "Section main"),
+			&mut workspace,
+			&mut state,
+		);
+		handle_notification(
+			&client,
+			did_change(TEST_URI, "Function myFunc\nFunctionEnd"),
+			&mut workspace,
+			&mut state,
+		);
+
+		assert_eq!(
+			workspace.document(&uri(TEST_URI)).unwrap().text,
+			"Function myFunc\nFunctionEnd"
+		);
+		assert_eq!(client.diagnostics().len(), 2);
+	}
+
+	/// Without a compiler there is nothing to run on save, and the diagnostics
+	/// already published stay as they are.
+	#[test]
+	fn saving_without_a_compiler_says_nothing() {
+		let client = Recorder::new();
+		let mut workspace = workspace_with(&[(TEST_URI, "Section main")]);
+
+		handle_notification(
+			&client,
+			Notification::new(
+				DidSaveTextDocument::METHOD.to_string(),
+				json!({ "textDocument": { "uri": TEST_URI } }),
+			),
+			&mut workspace,
+			&mut quiet_state(),
+		);
+
+		assert!(client.is_silent());
+	}
+
+	#[test]
+	fn a_configuration_change_reloads_the_state_and_says_so() {
+		let client = Recorder::new();
+		let mut state = quiet_state();
+
+		handle_notification(
+			&client,
+			configuration_change(json!({ "nsis": { "formatter": { "print_width": 100 } } })),
+			&mut Workspace::new(),
+			&mut state,
+		);
+
+		assert_eq!(state.print_width, 100);
+		assert!(client.logs().iter().any(|l| l == "Configuration reloaded"));
+	}
+
+	#[test]
+	fn unparseable_settings_are_logged_and_left_alone() {
+		let client = Recorder::new();
+		let mut state = quiet_state();
+		state.print_width = 80;
+
+		handle_notification(
+			&client,
+			configuration_change(json!({ "formatter": { "print_width": "wide" } })),
+			&mut Workspace::new(),
+			&mut state,
+		);
+
+		assert_eq!(state.print_width, 80);
+		assert_eq!(client.logs().len(), 1);
+		assert!(client.logs()[0].contains("could not be parsed"));
+	}
+
+	/// Clients that keep their settings server-side send `null`. There is
+	/// nothing to reload and nothing worth logging.
+	#[test]
+	fn settings_the_client_will_not_send_are_ignored_silently() {
+		let client = Recorder::new();
+
+		handle_notification(
+			&client,
+			configuration_change(serde_json::Value::Null),
+			&mut Workspace::new(),
+			&mut quiet_state(),
+		);
+
+		assert!(client.is_silent());
+	}
+
+	#[test]
+	fn a_request_is_answered_once() {
+		let client = Recorder::new();
+		let workspace = workspace_with(&[(TEST_URI, "!include file.nsh")]);
+
+		handle_request(
+			&client,
+			Request::new(
+				1.into(),
+				HoverRequest::METHOD.to_string(),
+				position_params(TEST_URI, 0, 2),
+			),
+			&workspace,
+			&quiet_state(),
+		);
+
+		assert!(client.response::<Hover>().is_some());
+	}
+
+	/// A method the server never advertised is dropped rather than answered.
+	#[test]
+	fn an_unknown_request_is_left_alone() {
+		let client = Recorder::new();
+
+		handle_request(
+			&client,
+			Request::new(1.into(), "textDocument/inlayHint".to_string(), json!({})),
+			&Workspace::new(),
+			&quiet_state(),
+		);
+
+		assert!(client.is_silent());
 	}
 }
