@@ -2,6 +2,7 @@ mod cli;
 mod client;
 mod compiler;
 mod context;
+mod deprecation;
 mod diagnostics;
 mod nsis_data;
 mod position;
@@ -15,8 +16,8 @@ use ardent::{EndOfLine, Formatter, FormatterOptions};
 use clap::Parser;
 use lsp_server::{Connection, Message, Notification, Request};
 use lsp_types::{
-	CodeAction, CodeActionKind, CodeActionParams, CodeActionProviderCapability, CodeActionResponse,
-	CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
+	CodeActionParams, CodeActionProviderCapability, CodeActionResponse, CompletionItem,
+	CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
 	CompletionTextEdit, Diagnostic, DiagnosticSeverity, DocumentFormattingParams, DocumentSymbol,
 	DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
 	Hover, HoverContents, HoverParams, HoverProviderCapability, Location, MarkupContent,
@@ -404,7 +405,7 @@ fn run_compiler_diagnostics(
 		return;
 	};
 
-	let mut all_diagnostics = compute_diagnostics(text);
+	let mut all_diagnostics = deprecation::scan(text);
 
 	let Ok(output) = compiler::run_makensis(makensis_path, &file_path, &state.preprocess_mode)
 	else {
@@ -487,7 +488,7 @@ fn hover_for_word(word: &str) -> Option<String> {
 		Known::Variable { description, .. } | Known::Constant { description, .. } => {
 			format!("**{}**\n\n{}", title, description)
 		}
-		Known::Deprecated(_) => format!("**{}** *(deprecated)*", title),
+		Known::Deprecated(dep) => deprecation::hover(dep),
 	})
 }
 
@@ -644,37 +645,7 @@ fn parse_error_position(msg: &str) -> Option<(u32, u32)> {
 }
 
 fn publish_diagnostics(client: &impl Client, uri: lsp_types::Uri, text: &str) {
-	client.publish_diagnostics(uri, compute_diagnostics(text));
-}
-
-fn compute_diagnostics(text: &str) -> Vec<Diagnostic> {
-	let mut diagnostics = Vec::new();
-
-	for (line_num, line) in text.lines().enumerate() {
-		let trimmed = line.trim();
-		let first_word = match trimmed.split_whitespace().next() {
-			Some(w) => w,
-			None => continue,
-		};
-
-		if let Some(Known::Deprecated(deprecated)) = nsis_data::lookup(first_word) {
-			let col = line.len() - line.trim_start().len();
-			let start_utf16 = byte_to_utf16_offset(line, col);
-			let end_utf16 = byte_to_utf16_offset(line, col + first_word.len());
-			diagnostics.push(Diagnostic {
-				range: Range::new(
-					Position::new(line_num as u32, start_utf16),
-					Position::new(line_num as u32, end_utf16),
-				),
-				severity: Some(DiagnosticSeverity::WARNING),
-				source: Some("nsis-lsp".into()),
-				message: format!("'{}' is deprecated", deprecated),
-				..Default::default()
-			});
-		}
-	}
-
-	diagnostics
+	client.publish_diagnostics(uri, deprecation::scan(text));
 }
 
 // ── Go to Definition ──
@@ -1015,56 +986,19 @@ fn count_active_parameter(line: &str, col: usize, command: &str) -> u32 {
 
 // ── Code Actions ──
 
-const DEPRECATED_REPLACEMENTS: &[(&str, &str)] = &[
-	("SubSection", "SectionGroup"),
-	("SubSectionEnd", "SectionGroupEnd"),
-];
-
+/// Every fix on offer for the diagnostics the client sent back.
+///
+/// One diagnostic that nothing can be done about is one diagnostic skipped —
+/// it says nothing about the rest of the request.
 fn handle_code_actions(params: CodeActionParams) -> Option<CodeActionResponse> {
 	let uri = params.text_document.uri;
-	let mut actions = Vec::new();
-
-	for diag in &params.context.diagnostics {
-		if diag.source.as_deref() != Some("nsis-lsp") || !diag.message.contains("deprecated") {
-			continue;
-		}
-
-		let deprecated = diag
-			.message
-			.strip_prefix("'")
-			.and_then(|s| s.strip_suffix("' is deprecated"))?;
-
-		let replacement = DEPRECATED_REPLACEMENTS
-			.iter()
-			.find(|(old, _)| old.eq_ignore_ascii_case(deprecated))
-			.map(|(_, new)| *new)?;
-
-		#[allow(clippy::mutable_key_type)]
-		let mut changes = HashMap::new();
-		changes.insert(
-			uri.clone(),
-			vec![TextEdit {
-				range: diag.range,
-				new_text: replacement.to_string(),
-			}],
-		);
-
-		actions.push(CodeAction {
-			title: format!("Replace with '{replacement}'"),
-			kind: Some(CodeActionKind::QUICKFIX),
-			diagnostics: Some(vec![diag.clone()]),
-			edit: Some(WorkspaceEdit {
-				changes: Some(changes),
-				..Default::default()
-			}),
-			is_preferred: Some(true),
-			..Default::default()
-		});
-	}
 
 	Some(
-		actions
-			.into_iter()
+		params
+			.context
+			.diagnostics
+			.iter()
+			.filter_map(|diag| deprecation::fix(&uri, diag))
 			.map(lsp_types::CodeActionOrCommand::CodeAction)
 			.collect(),
 	)
@@ -1481,30 +1415,6 @@ mod tests {
 		assert!(
 			handle_references(&workspace, reference_params("file:///gone.nsi", 0, 10)).is_none()
 		);
-	}
-
-	// ── compute_diagnostics ──
-
-	#[test]
-	fn compute_diagnostics_deprecated_command() {
-		let text = "SubSection test";
-		let diags = compute_diagnostics(text);
-		assert_eq!(diags.len(), 1);
-		assert!(diags[0].message.contains("deprecated"));
-	}
-
-	#[test]
-	fn compute_diagnostics_no_deprecated() {
-		let text = "Section main\nSectionEnd";
-		let diags = compute_diagnostics(text);
-		assert!(diags.is_empty());
-	}
-
-	#[test]
-	fn compute_diagnostics_case_insensitive() {
-		let text = "subsection test";
-		let diags = compute_diagnostics(text);
-		assert_eq!(diags.len(), 1);
 	}
 
 	// ── hover_for_word ──

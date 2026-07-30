@@ -112,8 +112,29 @@ pub enum Known {
 		name: &'static str,
 		description: &'static str,
 	},
-	/// A command NSIS still accepts but no longer documents.
-	Deprecated(&'static str),
+	/// A command NSIS no longer documents.
+	Deprecated(&'static Deprecated),
+}
+
+/// A command NSIS no longer documents, and what can be said in its place.
+pub struct Deprecated {
+	pub name: &'static str,
+	pub replacement: Replacement,
+}
+
+/// What NSIS offers instead of a deprecated command.
+///
+/// The three variants are three different situations, not three shades of one:
+/// only a [`Swap`](Replacement::Swap) can be applied as a quickfix, because
+/// only a `Swap` names a command that means the same thing.
+pub enum Replacement {
+	/// A modern command that does the same job — safe to substitute verbatim.
+	Swap(&'static str),
+	/// No drop-in exists, but there is something worth telling the user. A full
+	/// sentence, rendered after the deprecation notice.
+	Advice(&'static str),
+	/// The command is gone and nothing takes its place.
+	None,
 }
 
 impl Known {
@@ -122,7 +143,7 @@ impl Known {
 		match self {
 			Known::Command(entry) => &entry.name,
 			Known::Variable { name, .. } | Known::Constant { name, .. } => name,
-			Known::Deprecated(name) => name,
+			Known::Deprecated(dep) => dep.name,
 		}
 	}
 }
@@ -155,8 +176,8 @@ pub fn lookup(word: &str) -> Option<Known> {
 
 	DEPRECATED_COMMANDS
 		.iter()
-		.find(|dep| dep.eq_ignore_ascii_case(word))
-		.map(|dep| Known::Deprecated(dep))
+		.find(|dep| dep.name.eq_ignore_ascii_case(word))
+		.map(Known::Deprecated)
 }
 
 fn lookup_doc(word: &str) -> Option<&'static DocEntry> {
@@ -183,6 +204,17 @@ pub fn variables() -> impl Iterator<Item = (&'static str, &'static str)> {
 /// Every constant, as `(NAME, description)`.
 pub fn constants() -> impl Iterator<Item = (&'static str, &'static str)> {
 	CONSTANTS.iter().copied()
+}
+
+/// Every deprecated command, in no particular order.
+///
+/// Unlike the other three tables, nothing in the server walks this one at
+/// runtime — a deprecated command is never offered as a completion. It is here
+/// so the tests that guard the table can be written as loops over it, and can
+/// therefore never fall behind an entry added later.
+#[cfg(test)]
+pub fn deprecated() -> impl Iterator<Item = &'static Deprecated> {
+	DEPRECATED_COMMANDS.iter()
 }
 
 const BUILTIN_VARIABLES: &[(&str, &str)] = &[
@@ -260,22 +292,73 @@ const BUILTIN_VARIABLES: &[(&str, &str)] = &[
 	("$R9", "User variable $R9"),
 ];
 
-const DEPRECATED_COMMANDS: &[&str] = &[
-	"CompareDLLVersions",
-	"CompareFileTimes",
-	"DirShow",
-	"DisabledBitmap",
-	"EnabledBitmap",
-	"GetFullDLLPath",
-	"GetParent",
-	"GetWinampInstPath",
-	"LangStringUP",
-	"PackEXEHeader",
-	"SectionDivider",
-	"SetPluginUnload",
-	"SubSection",
-	"SubSectionEnd",
-	"UninstallExeName",
+/// Commands NSIS no longer documents.
+///
+/// The `Swap` targets and the `Advice` wording come from `makensis -CMDHELP` on
+/// NSIS 3.12: a `Swap` is one the compiler still accepts and that means the same
+/// thing, `Advice` is one it accepts but that no longer does anything useful,
+/// and `None` is one it rejects outright.
+const DEPRECATED_COMMANDS: &[Deprecated] = &[
+	Deprecated {
+		name: "CompareDLLVersions",
+		replacement: Replacement::None,
+	},
+	Deprecated {
+		name: "CompareFileTimes",
+		replacement: Replacement::None,
+	},
+	Deprecated {
+		name: "DirShow",
+		replacement: Replacement::Advice("It does not currently work."),
+	},
+	Deprecated {
+		name: "DisabledBitmap",
+		replacement: Replacement::None,
+	},
+	Deprecated {
+		name: "EnabledBitmap",
+		replacement: Replacement::None,
+	},
+	Deprecated {
+		name: "GetFullDLLPath",
+		replacement: Replacement::None,
+	},
+	Deprecated {
+		name: "GetParent",
+		replacement: Replacement::Advice("Use the ${GetParent} macro from FileFunc.nsh instead."),
+	},
+	Deprecated {
+		name: "GetWinampInstPath",
+		replacement: Replacement::None,
+	},
+	Deprecated {
+		name: "LangStringUP",
+		replacement: Replacement::Swap("LangString"),
+	},
+	Deprecated {
+		name: "PackEXEHeader",
+		replacement: Replacement::None,
+	},
+	Deprecated {
+		name: "SectionDivider",
+		replacement: Replacement::None,
+	},
+	Deprecated {
+		name: "SetPluginUnload",
+		replacement: Replacement::Advice("Plug-ins should handle unloading on their own."),
+	},
+	Deprecated {
+		name: "SubSection",
+		replacement: Replacement::Swap("SectionGroup"),
+	},
+	Deprecated {
+		name: "SubSectionEnd",
+		replacement: Replacement::Swap("SectionGroupEnd"),
+	},
+	Deprecated {
+		name: "UninstallExeName",
+		replacement: Replacement::Advice("Use WriteUninstaller from a section instead."),
+	},
 ];
 
 const CONSTANTS: &[(&str, &str)] = &[
@@ -413,11 +496,30 @@ mod tests {
 	/// `Command` — and the deprecation warning would silently stop firing.
 	#[test]
 	fn no_deprecated_command_is_also_documented() {
-		for dep in DEPRECATED_COMMANDS {
+		for dep in deprecated() {
 			assert_eq!(
-				kind_of(dep),
+				kind_of(dep.name),
 				Some("deprecated"),
-				"{dep} is shadowed by another table"
+				"{} is shadowed by another table",
+				dep.name
+			);
+		}
+	}
+
+	/// Every command a `Swap` points at has to be one the reference manual
+	/// documents, or the quickfix would trade a deprecated command for a
+	/// nonexistent one.
+	#[test]
+	fn every_swap_target_is_a_documented_command() {
+		for dep in deprecated() {
+			let Replacement::Swap(target) = dep.replacement else {
+				continue;
+			};
+			assert_eq!(
+				kind_of(target),
+				Some("command"),
+				"{} points at {target}, which is not a documented command",
+				dep.name
 			);
 		}
 	}
