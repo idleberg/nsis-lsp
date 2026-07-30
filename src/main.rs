@@ -38,6 +38,7 @@ use cli::Cli;
 use client::{Client, Stdio};
 use compiler::PreprocessMode;
 use context::SyntaxContext;
+use nsis_data::Known;
 use position::{byte_to_utf16_offset, is_ident_char, line_at, utf16_to_byte_offset};
 use symbols::DocumentIndex;
 use workspace::Workspace;
@@ -468,39 +469,26 @@ fn handle_hover(workspace: &Workspace, params: HoverParams) -> Option<Hover> {
 }
 
 fn hover_for_word(word: &str) -> Option<String> {
-	let bare = word.trim_start_matches('$');
+	let known = nsis_data::lookup(word)?;
+	// Headed with the canonical spelling, not whatever case the user typed.
+	let title = known.name();
 
-	if let Some(entry) = nsis_data::lookup_doc(word) {
-		let mut content = format!("**{}**\n\n{}", entry.name, entry.description);
-		if let Some(params) = &entry.parameters {
-			content.push_str(&format!("\n\n**Parameters:**\n```\n{}\n```", params));
+	Some(match &known {
+		Known::Command(entry) => {
+			let mut content = format!("**{}**\n\n{}", title, entry.description);
+			if let Some(params) = &entry.parameters {
+				content.push_str(&format!("\n\n**Parameters:**\n```\n{}\n```", params));
+			}
+			if let Some(example) = &entry.example {
+				content.push_str(&format!("\n\n**Example:**\n```nsis\n{}\n```", example));
+			}
+			content
 		}
-		if let Some(example) = &entry.example {
-			content.push_str(&format!("\n\n**Example:**\n```nsis\n{}\n```", example));
+		Known::Variable { description, .. } | Known::Constant { description, .. } => {
+			format!("**{}**\n\n{}", title, description)
 		}
-		return Some(content);
-	}
-
-	for (var, desc) in nsis_data::BUILTIN_VARIABLES {
-		let var_bare = var.trim_start_matches('$');
-		if var_bare.eq_ignore_ascii_case(bare) || var.eq_ignore_ascii_case(word) {
-			return Some(format!("**{}**\n\n{}", var, desc));
-		}
-	}
-
-	for (name, desc) in nsis_data::CONSTANTS {
-		if name.eq_ignore_ascii_case(word) {
-			return Some(format!("**{}**\n\n{}", name, desc));
-		}
-	}
-
-	for dep in nsis_data::DEPRECATED_COMMANDS {
-		if dep.eq_ignore_ascii_case(word) {
-			return Some(format!("**{}** *(deprecated)*", dep));
-		}
-	}
-
-	None
+		Known::Deprecated(_) => format!("**{}** *(deprecated)*", title),
+	})
 }
 
 // ── Completion ──
@@ -510,7 +498,7 @@ fn hover_for_word(word: &str) -> Option<String> {
 static CODE_ITEMS: LazyLock<Vec<CompletionItem>> = LazyLock::new(|| {
 	let mut items = Vec::new();
 
-	for entry in nsis_data::DOCS.values() {
+	for entry in nsis_data::commands() {
 		let kind = if entry.name.starts_with('!') {
 			CompletionItemKind::KEYWORD
 		} else if entry.name.starts_with('.') || entry.name.starts_with("un.") {
@@ -531,7 +519,7 @@ static CODE_ITEMS: LazyLock<Vec<CompletionItem>> = LazyLock::new(|| {
 		});
 	}
 
-	for (name, desc) in nsis_data::CONSTANTS {
+	for (name, desc) in nsis_data::constants() {
 		items.push(CompletionItem {
 			label: name.to_string(),
 			kind: Some(CompletionItemKind::CONSTANT),
@@ -546,8 +534,7 @@ static CODE_ITEMS: LazyLock<Vec<CompletionItem>> = LazyLock::new(|| {
 /// Items that interpolate inside a quoted string, and are therefore valid in
 /// both string and code position.
 static INTERPOLATED_ITEMS: LazyLock<Vec<CompletionItem>> = LazyLock::new(|| {
-	nsis_data::BUILTIN_VARIABLES
-		.iter()
+	nsis_data::variables()
 		.map(|(var, desc)| CompletionItem {
 			label: var.to_string(),
 			kind: Some(CompletionItemKind::VARIABLE),
@@ -670,23 +657,20 @@ fn compute_diagnostics(text: &str) -> Vec<Diagnostic> {
 			None => continue,
 		};
 
-		for deprecated in nsis_data::DEPRECATED_COMMANDS {
-			if first_word.eq_ignore_ascii_case(deprecated) {
-				let col = line.len() - line.trim_start().len();
-				let start_utf16 = byte_to_utf16_offset(line, col);
-				let end_utf16 = byte_to_utf16_offset(line, col + first_word.len());
-				diagnostics.push(Diagnostic {
-					range: Range::new(
-						Position::new(line_num as u32, start_utf16),
-						Position::new(line_num as u32, end_utf16),
-					),
-					severity: Some(DiagnosticSeverity::WARNING),
-					source: Some("nsis-lsp".into()),
-					message: format!("'{}' is deprecated", deprecated),
-					..Default::default()
-				});
-				break;
-			}
+		if let Some(Known::Deprecated(deprecated)) = nsis_data::lookup(first_word) {
+			let col = line.len() - line.trim_start().len();
+			let start_utf16 = byte_to_utf16_offset(line, col);
+			let end_utf16 = byte_to_utf16_offset(line, col + first_word.len());
+			diagnostics.push(Diagnostic {
+				range: Range::new(
+					Position::new(line_num as u32, start_utf16),
+					Position::new(line_num as u32, end_utf16),
+				),
+				severity: Some(DiagnosticSeverity::WARNING),
+				source: Some("nsis-lsp".into()),
+				message: format!("'{}' is deprecated", deprecated),
+				..Default::default()
+			});
 		}
 	}
 
@@ -904,20 +888,10 @@ fn handle_rename(workspace: &Workspace, params: RenameParams) -> Option<Workspac
 	})
 }
 
+/// Whether NSIS already defines `word`, and it is therefore not the user's to
+/// rename.
 fn is_builtin(word: &str) -> bool {
-	let bare = word.trim_start_matches('$');
-	for (var, _) in nsis_data::BUILTIN_VARIABLES {
-		let v = var.trim_start_matches('$');
-		if v.eq_ignore_ascii_case(bare) {
-			return true;
-		}
-	}
-	for (name, _) in nsis_data::CONSTANTS {
-		if name.eq_ignore_ascii_case(word) {
-			return true;
-		}
-	}
-	nsis_data::lookup_doc(word).is_some()
+	nsis_data::lookup(word).is_some()
 }
 
 // ── Signature Help ──
@@ -938,7 +912,9 @@ fn handle_signature_help(
 
 	let trimmed = line_str.trim();
 	let command = trimmed.split_whitespace().next()?;
-	let entry = nsis_data::lookup_doc(command)?;
+	let Known::Command(entry) = nsis_data::lookup(command)? else {
+		return None;
+	};
 	let params_str = entry.parameters.as_deref()?;
 
 	let parameters = parse_parameters(params_str);

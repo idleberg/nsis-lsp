@@ -83,8 +83,7 @@ impl Client for Stdio<'_> {
 	fn send_response(&self, id: RequestId, result: serde_json::Value) {
 		let response = Response {
 			id,
-			result: Some(result),
-			error: None,
+			response_result: Ok(result),
 		};
 		self.connection
 			.sender
@@ -116,7 +115,10 @@ impl Recorder {
 	/// answered.
 	pub fn response<T: serde::de::DeserializeOwned>(&self) -> Option<T> {
 		self.messages.borrow().iter().find_map(|msg| match msg {
-			Message::Response(r) => serde_json::from_value(r.result.clone()?).ok(),
+			Message::Response(r) => {
+				let result = r.response_result.as_ref().ok()?;
+				serde_json::from_value(result.clone()).ok()
+			}
 			_ => None,
 		})
 	}
@@ -163,8 +165,7 @@ impl Client for Recorder {
 	fn send_response(&self, id: RequestId, result: serde_json::Value) {
 		self.messages.borrow_mut().push(Message::Response(Response {
 			id,
-			result: Some(result),
-			error: None,
+			response_result: Ok(result),
 		}));
 	}
 
