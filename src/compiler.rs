@@ -60,6 +60,35 @@ pub fn run_makensis(
 	})
 }
 
+/// The path `makensis` should be handed for a document's `Uri`.
+///
+/// The compiler reads the file from disk, so a document that lives anywhere but
+/// the local filesystem has nothing to compile.
+pub fn uri_to_file_path(uri_str: &str) -> Option<String> {
+	let stripped = uri_str.strip_prefix("file://")?;
+	Some(percent_decode(stripped))
+}
+
+fn percent_decode(s: &str) -> String {
+	let mut result = Vec::new();
+	let bytes = s.as_bytes();
+	let mut i = 0;
+	while i < bytes.len() {
+		if bytes[i] == b'%'
+			&& i + 2 < bytes.len()
+			&& let Ok(byte) =
+				u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+		{
+			result.push(byte);
+			i += 3;
+			continue;
+		}
+		result.push(bytes[i]);
+		i += 1;
+	}
+	String::from_utf8_lossy(&result).into_owned()
+}
+
 fn which(binary: &str) -> Option<String> {
 	let path_var = std::env::var("PATH").ok()?;
 	let sep = if cfg!(windows) { ';' } else { ':' };
@@ -131,5 +160,38 @@ mod tests {
 	#[test]
 	fn which_nonexistent_binary() {
 		assert_eq!(which("__no_such_binary_xyz__"), None);
+	}
+
+	// ── percent_decode / uri_to_file_path ──
+
+	#[test]
+	fn percent_decode_no_encoding() {
+		assert_eq!(percent_decode("/foo/bar.nsi"), "/foo/bar.nsi");
+	}
+
+	#[test]
+	fn percent_decode_spaces() {
+		assert_eq!(
+			percent_decode("/my%20path/file%20name"),
+			"/my path/file name"
+		);
+	}
+
+	#[test]
+	fn percent_decode_mixed() {
+		assert_eq!(percent_decode("a%2Fb%25c"), "a/b%c");
+	}
+
+	#[test]
+	fn uri_to_file_path_valid() {
+		assert_eq!(
+			uri_to_file_path("file:///home/user/test.nsi"),
+			Some("/home/user/test.nsi".into())
+		);
+	}
+
+	#[test]
+	fn uri_to_file_path_not_file_uri() {
+		assert_eq!(uri_to_file_path("https://example.com"), None);
 	}
 }
