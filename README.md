@@ -71,6 +71,14 @@ The language server accepts settings via LSP `initializationOptions`:
 Indentation is not configurable here — the formatter takes it from the `tabSize`
 and `insertSpaces` values the editor sends with each formatting request.
 
+## Integrations
+
+The following Editor extensions integrate `nsis-lsp`:
+
+- [nova-nsis](https://github.com/idleberg/nova-nsis)
+- [sublime-lsp-nsis](https://github.com/idleberg/sublime-lsp-nsis)
+- [zed-nsis](https://github.com/idleberg/zed-nsis-extension)
+
 ## License
 
 This work is licensed under the [Apache License, Version 2.0](LICENSE-APACHE) or [The MIT License](LICENSE-MIT).
