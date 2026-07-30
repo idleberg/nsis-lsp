@@ -33,3 +33,7 @@ run = "cargo clippy -- --deny warnings"
 [tasks.test]
 description = "Run all tests"
 run = "cargo test"
+
+[tasks.install]
+description = "Install to PATH"
+run = "cargo install --path ."
