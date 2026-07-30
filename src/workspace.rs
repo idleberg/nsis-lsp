@@ -3,12 +3,12 @@
 
 use std::collections::HashMap;
 
-use lsp_types::{Diagnostic, Position, Range, Uri};
+use lsp_types::{Diagnostic, Location, Position, Range, TextEdit, Uri};
 
 use crate::context::{self, SyntaxContext};
 use crate::deprecation;
 use crate::position::{byte_to_utf16_offset, is_ident_char, line_at, utf16_to_byte_offset};
-use crate::symbols::{self, DocumentIndex};
+use crate::symbols::{self, DocumentIndex, NsisSymbolKind, SymbolDef};
 
 /// One identifier, read off a position in a document.
 ///
@@ -153,6 +153,123 @@ impl Workspace {
 		let doc = self.document(uri)?;
 		let ident = doc.identifier_at(pos)?;
 		Some((doc, ident))
+	}
+
+	/// Every document in `Uri` order.
+	///
+	/// The map hands them back in whatever order it likes, which would make a
+	/// resolution that stops at the first answer depend on where a document
+	/// happened to hash to.
+	fn ordered(&self) -> Vec<&Document> {
+		let mut docs: Vec<&Document> = self.documents().collect();
+		docs.sort_by(|a, b| a.uri.as_str().cmp(b.uri.as_str()));
+		docs
+	}
+
+	/// Where `name` is defined, searched over every open document.
+	///
+	/// A name is looked up from somewhere — `from` is the document the user is
+	/// in — and that document wins, because a script that declares a name of
+	/// its own means that one. Everything else is searched in `Uri` order, so
+	/// two scripts declaring the same name resolve the same way every time.
+	///
+	/// Resolving across documents rather than within one is what lets a request
+	/// be answered from a use site: `${APP_NAME}` in an installer script is the
+	/// `!define` in the header it includes, and until this looked past the
+	/// current document a rename from the use site had nothing to rename.
+	pub fn definition(&self, from: &Uri, name: &str) -> Option<Definition<'_>> {
+		let here = self
+			.document(from)
+			.and_then(|doc| Definition::of(doc, name));
+		if here.is_some() {
+			return here;
+		}
+
+		self.ordered()
+			.into_iter()
+			.filter(|doc| doc.uri.as_str() != from.as_str())
+			.find_map(|doc| Definition::of(doc, name))
+	}
+
+	/// Every use of `name` as a `kind`, in every open document. Use sites only —
+	/// the declarations are [`Definition`]'s business.
+	pub fn references(&self, name: &str, kind: NsisSymbolKind) -> Vec<Location> {
+		self.ordered()
+			.into_iter()
+			.flat_map(|doc| {
+				symbols::find_references(&doc.text, name, kind)
+					.into_iter()
+					.map(|range| Location {
+						uri: doc.uri.clone(),
+						range,
+					})
+			})
+			.collect()
+	}
+
+	/// Everything a rename of `name` has to rewrite, keyed by the document it
+	/// belongs to. A document with nothing to rewrite is absent rather than
+	/// present and empty.
+	#[allow(clippy::mutable_key_type)]
+	pub fn rename_edits(
+		&self,
+		name: &str,
+		kind: NsisSymbolKind,
+		new_name: &str,
+	) -> HashMap<Uri, Vec<TextEdit>> {
+		let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
+
+		for doc in self.documents() {
+			let mut edits: Vec<TextEdit> = symbols::find_references(&doc.text, name, kind)
+				.into_iter()
+				.map(|range| TextEdit {
+					range,
+					new_text: new_name.to_string(),
+				})
+				.collect();
+
+			// Those are the use sites; the declarations themselves have to be
+			// rewritten too, and there may be more than one of them.
+			edits.extend(doc.index.definitions_of(name, kind).map(|sym| TextEdit {
+				range: sym.selection_range,
+				new_text: new_name.to_string(),
+			}));
+
+			if !edits.is_empty() {
+				changes.insert(doc.uri.clone(), edits);
+			}
+		}
+
+		changes
+	}
+}
+
+/// A definition, and the document it was found in.
+///
+/// The document travels with the symbol because a caller that searched the
+/// whole workspace no longer knows which one answered, and both the `Uri` it
+/// reports and the kind it renames by come from the same place.
+pub struct Definition<'a> {
+	/// The document holding the declaration.
+	pub uri: &'a Uri,
+	/// The declaration itself.
+	pub symbol: &'a SymbolDef,
+}
+
+impl<'a> Definition<'a> {
+	fn of(doc: &'a Document, name: &str) -> Option<Self> {
+		doc.index.definition(name).map(|symbol| Definition {
+			uri: &doc.uri,
+			symbol,
+		})
+	}
+
+	/// Where the declaration sits, as the client wants to hear it.
+	pub fn location(&self) -> Location {
+		Location {
+			uri: self.uri.clone(),
+			range: self.symbol.selection_range,
+		}
 	}
 }
 
@@ -356,6 +473,91 @@ mod tests {
 			.unwrap();
 		assert_eq!(ident.text, "$INSTDIR");
 		assert_eq!(doc.uri, uri(URI));
+	}
+
+	// ── definition, references, rename_edits ──
+
+	const A_URI: &str = "file:///a.nsi";
+	const B_URI: &str = "file:///b.nsi";
+
+	/// A header declaring a name, and a script that only uses it.
+	fn two_documents() -> Workspace {
+		let mut workspace = Workspace::new();
+		workspace.open(
+			uri(A_URI),
+			"!define APP_NAME \"Test\"\nDetailPrint ${APP_NAME}".to_string(),
+		);
+		workspace.open(
+			uri(B_URI),
+			"DetailPrint ${APP_NAME}\nDetailPrint ${APP_NAME}".to_string(),
+		);
+		workspace
+	}
+
+	/// The point of resolving over the workspace: a name used in one document
+	/// and declared in another still has a definition.
+	#[test]
+	fn a_definition_is_found_in_another_document() {
+		let workspace = two_documents();
+		let def = workspace.definition(&uri(B_URI), "APP_NAME").unwrap();
+
+		assert_eq!(def.uri, &uri(A_URI));
+		assert_eq!(def.symbol.name, "APP_NAME");
+		assert_eq!(def.location().range.start.line, 0);
+	}
+
+	/// A document that declares a name of its own means that one, whatever the
+	/// rest of the workspace says.
+	#[test]
+	fn the_document_asked_from_wins() {
+		let mut workspace = two_documents();
+		workspace.open(uri(B_URI), "!define APP_NAME \"Other\"".to_string());
+
+		let def = workspace.definition(&uri(B_URI), "APP_NAME").unwrap();
+		assert_eq!(def.uri, &uri(B_URI));
+	}
+
+	#[test]
+	fn a_name_nothing_declares_has_no_definition() {
+		let workspace = two_documents();
+		assert!(workspace.definition(&uri(A_URI), "NOPE").is_none());
+	}
+
+	/// A request from a document that is not open still resolves — the name is
+	/// looked for everywhere, and only the preference for one document is lost.
+	#[test]
+	fn definition_from_an_unopened_document_still_searches_the_rest() {
+		let workspace = two_documents();
+		let def = workspace
+			.definition(&uri("file:///gone.nsi"), "APP_NAME")
+			.unwrap();
+
+		assert_eq!(def.uri, &uri(A_URI));
+	}
+
+	#[test]
+	fn references_span_every_open_document() {
+		let workspace = two_documents();
+		let locations = workspace.references("APP_NAME", NsisSymbolKind::Define);
+
+		assert_eq!(locations.iter().filter(|l| l.uri == uri(A_URI)).count(), 1);
+		assert_eq!(locations.iter().filter(|l| l.uri == uri(B_URI)).count(), 2);
+	}
+
+	/// A rename rewrites the uses and the declaration, and says nothing about a
+	/// document that has neither.
+	#[test]
+	fn rename_edits_cover_uses_and_declarations() {
+		let mut workspace = two_documents();
+		workspace.open(uri("file:///c.nsi"), "DetailPrint \"nothing\"".to_string());
+
+		#[allow(clippy::mutable_key_type)]
+		let changes = workspace.rename_edits("APP_NAME", NsisSymbolKind::Define, "PRODUCT");
+
+		assert_eq!(changes.len(), 2);
+		assert_eq!(changes[&uri(A_URI)].len(), 2); // one use plus the `!define`
+		assert_eq!(changes[&uri(B_URI)].len(), 2);
+		assert!(changes.values().flatten().all(|e| e.new_text == "PRODUCT"));
 	}
 
 	#[test]

@@ -9,7 +9,6 @@ mod position;
 mod symbols;
 mod workspace;
 
-use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use ardent::{EndOfLine, Formatter, FormatterOptions};
@@ -41,7 +40,6 @@ use compiler::PreprocessMode;
 use context::SyntaxContext;
 use nsis_data::Known;
 use position::{byte_to_utf16_offset, is_ident_char, line_at, utf16_to_byte_offset};
-use symbols::DocumentIndex;
 use workspace::{Document, Workspace};
 
 #[derive(Debug, Default, Deserialize)]
@@ -647,21 +645,10 @@ fn handle_goto_definition(
 	params: GotoDefinitionParams,
 ) -> Option<GotoDefinitionResponse> {
 	let at = params.text_document_position_params;
-	let (doc, ident) = workspace.identifier_at(&at.text_document.uri, at.position)?;
+	let (_, ident) = workspace.identifier_at(&at.text_document.uri, at.position)?;
+	let def = workspace.definition(&at.text_document.uri, &ident.bare)?;
 
-	find_symbol_location(&doc.uri, &doc.index, &ident.bare)
-}
-
-fn find_symbol_location(
-	uri: &lsp_types::Uri,
-	index: &DocumentIndex,
-	word: &str,
-) -> Option<GotoDefinitionResponse> {
-	let sym = index.definition(word)?;
-	Some(GotoDefinitionResponse::Scalar(Location {
-		uri: uri.clone(),
-		range: sym.selection_range,
-	}))
+	Some(GotoDefinitionResponse::Scalar(def.location()))
 }
 
 // ── Document Symbols ──
@@ -717,26 +704,16 @@ fn symbol_def_to_document_symbol(sym: &symbols::SymbolDef) -> DocumentSymbol {
 
 fn handle_references(workspace: &Workspace, params: ReferenceParams) -> Option<Vec<Location>> {
 	let at = &params.text_document_position;
-	let (doc, ident) = workspace.identifier_at(&at.text_document.uri, at.position)?;
-	let kind = doc.index.definition(&ident.bare)?.kind;
+	let (_, ident) = workspace.identifier_at(&at.text_document.uri, at.position)?;
+	let def = workspace.definition(&at.text_document.uri, &ident.bare)?;
 
 	let mut locations = Vec::new();
 
-	if params.context.include_declaration
-		&& let Some(GotoDefinitionResponse::Scalar(loc)) =
-			find_symbol_location(&doc.uri, &doc.index, &ident.bare)
-	{
-		locations.push(loc);
+	if params.context.include_declaration {
+		locations.push(def.location());
 	}
 
-	for other in workspace.documents() {
-		for range in symbols::find_references(&other.text, &ident.bare, kind) {
-			locations.push(Location {
-				uri: other.uri.clone(),
-				range,
-			});
-		}
-	}
+	locations.extend(workspace.references(&ident.bare, def.symbol.kind));
 
 	if locations.is_empty() {
 		None
@@ -751,13 +728,13 @@ fn handle_prepare_rename(
 	workspace: &Workspace,
 	params: lsp_types::TextDocumentPositionParams,
 ) -> Option<PrepareRenameResponse> {
-	let (doc, ident) = workspace.identifier_at(&params.text_document.uri, params.position)?;
+	let (_, ident) = workspace.identifier_at(&params.text_document.uri, params.position)?;
 
 	if is_builtin(&ident.text) {
 		return None;
 	}
 
-	doc.index.definition(&ident.bare)?;
+	workspace.definition(&params.text_document.uri, &ident.bare)?;
 
 	// The rename covers the bare identifier, not the sigil in front of it —
 	// renaming `$myVar` rewrites `myVar` and leaves the `$` where it is.
@@ -769,46 +746,19 @@ fn handle_prepare_rename(
 
 fn handle_rename(workspace: &Workspace, params: RenameParams) -> Option<WorkspaceEdit> {
 	let at = &params.text_document_position;
-	let (doc, ident) = workspace.identifier_at(&at.text_document.uri, at.position)?;
-	let kind = doc.index.definition(&ident.bare)?.kind;
+	let (_, ident) = workspace.identifier_at(&at.text_document.uri, at.position)?;
 
 	if is_builtin(&ident.text) {
 		return None;
 	}
 
-	let new_name = &params.new_name;
-
-	#[allow(clippy::mutable_key_type)]
-	let mut changes: HashMap<lsp_types::Uri, Vec<TextEdit>> = HashMap::new();
-
-	for other in workspace.documents() {
-		let mut edits: Vec<TextEdit> = symbols::find_references(&other.text, &ident.bare, kind)
-			.into_iter()
-			.map(|range| TextEdit {
-				range,
-				new_text: new_name.clone(),
-			})
-			.collect();
-
-		// The references above are use sites; the declarations themselves have to
-		// be rewritten too.
-		edits.extend(
-			other
-				.index
-				.definitions_of(&ident.bare, kind)
-				.map(|sym| TextEdit {
-					range: sym.selection_range,
-					new_text: new_name.clone(),
-				}),
-		);
-
-		if !edits.is_empty() {
-			changes.insert(other.uri.clone(), edits);
-		}
-	}
+	let kind = workspace
+		.definition(&at.text_document.uri, &ident.bare)?
+		.symbol
+		.kind;
 
 	Some(WorkspaceEdit {
-		changes: Some(changes),
+		changes: Some(workspace.rename_edits(&ident.bare, kind, &params.new_name)),
 		..Default::default()
 	})
 }
@@ -1332,11 +1282,58 @@ mod tests {
 		assert!(changes.values().flatten().all(|e| e.new_text == "PRODUCT"));
 	}
 
+	/// A use site is where a rename is usually started from, and the definition
+	/// is usually in the header the script includes rather than in the script
+	/// itself. Resolving across the open documents makes the two starting points
+	/// produce the same edit.
 	#[test]
 	fn rename_from_the_document_without_the_definition() {
-		let edit = handle_rename(&two_documents(), rename_params(B_URI, 0, 15, "PRODUCT"));
-		// The kind is only known where the symbol is defined.
-		assert!(edit.is_none());
+		#[allow(clippy::mutable_key_type)]
+		let from_use = handle_rename(&two_documents(), rename_params(B_URI, 0, 15, "PRODUCT"))
+			.unwrap()
+			.changes
+			.unwrap();
+		#[allow(clippy::mutable_key_type)]
+		let from_definition = handle_rename(&two_documents(), rename_params(A_URI, 0, 10, "PRODUCT"))
+			.unwrap()
+			.changes
+			.unwrap();
+
+		assert_eq!(from_use.len(), 2);
+		assert_eq!(from_use[&uri(A_URI)].len(), 2);
+		assert_eq!(from_use[&uri(B_URI)].len(), 2);
+		assert_eq!(from_use, from_definition);
+	}
+
+	/// `prepareRename` decides whether the client offers to rename at all, so it
+	/// has to agree with `rename` about where a name is defined.
+	#[test]
+	fn prepare_rename_offers_a_rename_from_a_use_site() {
+		match handle_prepare_rename(&two_documents(), position_params(B_URI, 0, 15)) {
+			Some(PrepareRenameResponse::RangeWithPlaceholder { placeholder, .. }) => {
+				assert_eq!(placeholder, "APP_NAME");
+			}
+			other => panic!("unexpected prepare rename response: {other:?}"),
+		}
+	}
+
+	/// The declaration is in another document, and the answer names that
+	/// document rather than the one the request came from.
+	#[test]
+	fn goto_definition_crosses_documents() {
+		let params = GotoDefinitionParams {
+			text_document_position_params: position_params(B_URI, 0, 15),
+			work_done_progress_params: Default::default(),
+			partial_result_params: Default::default(),
+		};
+
+		match handle_goto_definition(&two_documents(), params) {
+			Some(GotoDefinitionResponse::Scalar(loc)) => {
+				assert_eq!(loc.uri, uri(A_URI));
+				assert_eq!(loc.range.start.line, 0);
+			}
+			other => panic!("unexpected definition response: {other:?}"),
+		}
 	}
 
 	#[test]
