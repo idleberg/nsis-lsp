@@ -454,9 +454,9 @@ fn handle_formatting(
 
 fn handle_hover(workspace: &Workspace, params: HoverParams) -> Option<Hover> {
 	let at = params.text_document_position_params;
-	let (_, word) = workspace.word_at(&at.text_document.uri, at.position)?;
+	let (_, ident) = workspace.identifier_at(&at.text_document.uri, at.position)?;
 
-	hover_for_word(&word).map(|value| Hover {
+	hover_for_word(&ident.text).map(|value| Hover {
 		contents: HoverContents::Markup(MarkupContent {
 			kind: MarkupKind::Markdown,
 			value,
@@ -647,9 +647,9 @@ fn handle_goto_definition(
 	params: GotoDefinitionParams,
 ) -> Option<GotoDefinitionResponse> {
 	let at = params.text_document_position_params;
-	let (doc, word) = workspace.word_at(&at.text_document.uri, at.position)?;
+	let (doc, ident) = workspace.identifier_at(&at.text_document.uri, at.position)?;
 
-	find_symbol_location(&doc.uri, &doc.index, &word)
+	find_symbol_location(&doc.uri, &doc.index, &ident.bare)
 }
 
 fn find_symbol_location(
@@ -717,21 +717,20 @@ fn symbol_def_to_document_symbol(sym: &symbols::SymbolDef) -> DocumentSymbol {
 
 fn handle_references(workspace: &Workspace, params: ReferenceParams) -> Option<Vec<Location>> {
 	let at = &params.text_document_position;
-	let (doc, word) = workspace.word_at(&at.text_document.uri, at.position)?;
-	let bare = word.trim_start_matches('$').trim_start_matches('!');
-	let kind = doc.index.definition(&word)?.kind;
+	let (doc, ident) = workspace.identifier_at(&at.text_document.uri, at.position)?;
+	let kind = doc.index.definition(&ident.bare)?.kind;
 
 	let mut locations = Vec::new();
 
 	if params.context.include_declaration
 		&& let Some(GotoDefinitionResponse::Scalar(loc)) =
-			find_symbol_location(&doc.uri, &doc.index, bare)
+			find_symbol_location(&doc.uri, &doc.index, &ident.bare)
 	{
 		locations.push(loc);
 	}
 
 	for other in workspace.documents() {
-		for range in symbols::find_references(&other.text, bare, kind) {
+		for range in symbols::find_references(&other.text, &ident.bare, kind) {
 			locations.push(Location {
 				uri: other.uri.clone(),
 				range,
@@ -752,48 +751,28 @@ fn handle_prepare_rename(
 	workspace: &Workspace,
 	params: lsp_types::TextDocumentPositionParams,
 ) -> Option<PrepareRenameResponse> {
-	let pos = params.position;
-	let (doc, word) = workspace.word_at(&params.text_document.uri, pos)?;
-	let bare = word.trim_start_matches('$').trim_start_matches('!');
+	let (doc, ident) = workspace.identifier_at(&params.text_document.uri, params.position)?;
 
-	if is_builtin(&word) {
+	if is_builtin(&ident.text) {
 		return None;
 	}
 
-	doc.index.definition(&word)?;
+	doc.index.definition(&ident.bare)?;
 
-	// The rename range covers the bare identifier, without the sigil `word_at`
-	// keeps — renaming `$myVar` rewrites `myVar` and leaves the `$`.
-	let line_str = line_at(&doc.text, pos.line)?;
-	let col = utf16_to_byte_offset(line_str, pos.character);
-	let bytes = line_str.as_bytes();
-	let mut start = col;
-	let mut end = col;
-	while start > 0 && is_ident_char(bytes[start - 1]) {
-		start -= 1;
-	}
-	while end < bytes.len() && is_ident_char(bytes[end]) {
-		end += 1;
-	}
-
-	let range = Range::new(
-		Position::new(pos.line, byte_to_utf16_offset(line_str, start)),
-		Position::new(pos.line, byte_to_utf16_offset(line_str, end)),
-	);
-
+	// The rename covers the bare identifier, not the sigil in front of it —
+	// renaming `$myVar` rewrites `myVar` and leaves the `$` where it is.
 	Some(PrepareRenameResponse::RangeWithPlaceholder {
-		range,
-		placeholder: bare.to_string(),
+		range: ident.bare_range,
+		placeholder: ident.bare,
 	})
 }
 
 fn handle_rename(workspace: &Workspace, params: RenameParams) -> Option<WorkspaceEdit> {
 	let at = &params.text_document_position;
-	let (doc, word) = workspace.word_at(&at.text_document.uri, at.position)?;
-	let bare = word.trim_start_matches('$').trim_start_matches('!');
-	let kind = doc.index.definition(&word)?.kind;
+	let (doc, ident) = workspace.identifier_at(&at.text_document.uri, at.position)?;
+	let kind = doc.index.definition(&ident.bare)?.kind;
 
-	if is_builtin(&word) {
+	if is_builtin(&ident.text) {
 		return None;
 	}
 
@@ -803,7 +782,7 @@ fn handle_rename(workspace: &Workspace, params: RenameParams) -> Option<Workspac
 	let mut changes: HashMap<lsp_types::Uri, Vec<TextEdit>> = HashMap::new();
 
 	for other in workspace.documents() {
-		let mut edits: Vec<TextEdit> = symbols::find_references(&other.text, bare, kind)
+		let mut edits: Vec<TextEdit> = symbols::find_references(&other.text, &ident.bare, kind)
 			.into_iter()
 			.map(|range| TextEdit {
 				range,
@@ -813,10 +792,15 @@ fn handle_rename(workspace: &Workspace, params: RenameParams) -> Option<Workspac
 
 		// The references above are use sites; the declarations themselves have to
 		// be rewritten too.
-		edits.extend(other.index.definitions_of(bare, kind).map(|sym| TextEdit {
-			range: sym.selection_range,
-			new_text: new_name.clone(),
-		}));
+		edits.extend(
+			other
+				.index
+				.definitions_of(&ident.bare, kind)
+				.map(|sym| TextEdit {
+					range: sym.selection_range,
+					new_text: new_name.clone(),
+				}),
+		);
 
 		if !edits.is_empty() {
 			changes.insert(other.uri.clone(), edits);

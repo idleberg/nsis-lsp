@@ -3,12 +3,28 @@
 
 use std::collections::HashMap;
 
-use lsp_types::{Diagnostic, Position, Uri};
+use lsp_types::{Diagnostic, Position, Range, Uri};
 
 use crate::context::{self, SyntaxContext};
 use crate::deprecation;
 use crate::position::{byte_to_utf16_offset, is_ident_char, line_at, utf16_to_byte_offset};
 use crate::symbols::{self, DocumentIndex};
+
+/// One identifier, read off a position in a document.
+///
+/// NSIS writes an identifier with a sigil at some call sites and without it at
+/// others — `$myVar` is the same name as the `Var myVar` that declared it — so
+/// every caller needs both spellings and the place each one sits. Reading the
+/// line once and carrying all of it is what stops a second caller re-deriving
+/// the half the first one discarded, with a sigil rule that has drifted.
+pub struct Identifier {
+	/// The identifier as the user wrote it, sigil and all: `$myVar`, `!include`.
+	pub text: String,
+	/// The name beneath the sigil, which is what definitions are declared under.
+	pub bare: String,
+	/// Where the bare name sits. A rename rewrites this and leaves the sigil.
+	pub bare_range: Range,
+}
 
 /// One open document: the `Uri` it arrived under, its current text, and
 /// everything derived from that text.
@@ -36,10 +52,10 @@ impl Document {
 		}
 	}
 
-	/// The identifier under `pos`, including a leading `!` or `$` if one is
-	/// there. `None` in a comment, past the end of the line, or where there is
-	/// no identifier at all.
-	pub fn word_at(&self, pos: Position) -> Option<String> {
+	/// The identifier under `pos`. `None` in a comment, past the end of the
+	/// line, or where there is no identifier at all — a lone sigil with no name
+	/// after it is not one.
+	pub fn identifier_at(&self, pos: Position) -> Option<Identifier> {
 		let line_str = line_at(&self.text, pos.line)?;
 		let col = utf16_to_byte_offset(line_str, pos.character);
 		if col > line_str.len() {
@@ -61,15 +77,22 @@ impl Document {
 			end += 1;
 		}
 
-		if start > 0 && (bytes[start - 1] == b'!' || bytes[start - 1] == b'$') {
-			start -= 1;
-		}
-
 		if start == end {
 			return None;
 		}
 
-		Some(line_str[start..end].to_string())
+		let bare_start = start;
+		if start > 0 && (bytes[start - 1] == b'!' || bytes[start - 1] == b'$') {
+			start -= 1;
+		}
+
+		let at = |offset: usize| Position::new(pos.line, byte_to_utf16_offset(line_str, offset));
+
+		Some(Identifier {
+			text: line_str[start..end].to_string(),
+			bare: line_str[bare_start..end].to_string(),
+			bare_range: Range::new(at(bare_start), at(end)),
+		})
 	}
 
 	/// The last column of the document, as an LSP position.
@@ -126,10 +149,10 @@ impl Workspace {
 
 	/// The document at `uri` together with the identifier under `pos` — the
 	/// opening move of every position-based request.
-	pub fn word_at(&self, uri: &Uri, pos: Position) -> Option<(&Document, String)> {
+	pub fn identifier_at(&self, uri: &Uri, pos: Position) -> Option<(&Document, Identifier)> {
 		let doc = self.document(uri)?;
-		let word = doc.word_at(pos)?;
-		Some((doc, word))
+		let ident = doc.identifier_at(pos)?;
+		Some((doc, ident))
 	}
 }
 
@@ -147,45 +170,98 @@ mod tests {
 		Document::new(uri(URI), text.to_string())
 	}
 
-	// ── word_at ──
+	// ── identifier_at ──
+
+	fn text_at(doc: &Document, pos: Position) -> Option<String> {
+		doc.identifier_at(pos).map(|ident| ident.text)
+	}
 
 	#[test]
-	fn word_at_simple() {
+	fn identifier_at_simple() {
 		let doc = document("Section main\n  DetailPrint hello\nSectionEnd");
-		assert_eq!(doc.word_at(Position::new(1, 4)), Some("DetailPrint".into()));
+		assert_eq!(
+			text_at(&doc, Position::new(1, 4)),
+			Some("DetailPrint".into())
+		);
 	}
 
 	#[test]
-	fn word_at_bang_prefix() {
+	fn identifier_at_bang_prefix() {
 		let doc = document("!include file.nsh");
-		assert_eq!(doc.word_at(Position::new(0, 2)), Some("!include".into()));
+		assert_eq!(text_at(&doc, Position::new(0, 2)), Some("!include".into()));
 	}
 
 	#[test]
-	fn word_at_dollar_prefix() {
+	fn identifier_at_dollar_prefix() {
 		let doc = document("StrCpy $0 $INSTDIR");
-		assert_eq!(doc.word_at(Position::new(0, 12)), Some("$INSTDIR".into()));
+		assert_eq!(text_at(&doc, Position::new(0, 12)), Some("$INSTDIR".into()));
 	}
 
 	#[test]
-	fn word_at_out_of_range() {
+	fn identifier_at_out_of_range() {
 		let doc = document("hello");
-		assert_eq!(doc.word_at(Position::new(5, 0)), None);
+		assert!(doc.identifier_at(Position::new(5, 0)).is_none());
 	}
 
 	#[test]
-	fn word_at_in_comment_is_none() {
+	fn identifier_at_in_comment_is_none() {
 		let doc = document("# DetailPrint hello");
-		assert_eq!(doc.word_at(Position::new(0, 5)), None);
+		assert!(doc.identifier_at(Position::new(0, 5)).is_none());
 	}
 
 	/// A cursor touching the end of a word still reads that word; only one with
 	/// whitespace on both sides has nothing under it.
 	#[test]
-	fn word_at_a_boundary_takes_the_word_before_it() {
+	fn identifier_at_a_boundary_takes_the_word_before_it() {
 		let doc = document("Section  main");
-		assert_eq!(doc.word_at(Position::new(0, 7)), Some("Section".into()));
-		assert_eq!(doc.word_at(Position::new(0, 8)), None);
+		assert_eq!(text_at(&doc, Position::new(0, 7)), Some("Section".into()));
+		assert!(doc.identifier_at(Position::new(0, 8)).is_none());
+	}
+
+	/// The sigil is stripped and the name located in the same read, so no caller
+	/// has to trim it back off or walk the line again to find where it starts.
+	#[test]
+	fn an_identifier_carries_the_name_under_its_sigil() {
+		let doc = document("StrCpy $0 $INSTDIR");
+		let ident = doc.identifier_at(Position::new(0, 12)).unwrap();
+
+		assert_eq!(ident.text, "$INSTDIR");
+		assert_eq!(ident.bare, "INSTDIR");
+		assert_eq!(
+			ident.bare_range,
+			Range::new(Position::new(0, 11), Position::new(0, 18))
+		);
+	}
+
+	/// Without a sigil the two spellings coincide, so a caller can read `bare`
+	/// unconditionally.
+	#[test]
+	fn an_identifier_without_a_sigil_is_its_own_bare_name() {
+		let doc = document("Call myFunc");
+		let ident = doc.identifier_at(Position::new(0, 7)).unwrap();
+
+		assert_eq!(ident.text, "myFunc");
+		assert_eq!(ident.bare, "myFunc");
+	}
+
+	/// Columns are UTF-16 units, so the range is still right on a line the
+	/// client counts differently from Rust.
+	#[test]
+	fn identifier_ranges_count_utf16_columns() {
+		let doc = document("DetailPrint \"€\" $INSTDIR");
+		let ident = doc.identifier_at(Position::new(0, 18)).unwrap();
+
+		assert_eq!(ident.text, "$INSTDIR");
+		assert_eq!(ident.bare_range.start.character, 17);
+		assert_eq!(ident.bare_range.end.character, 24);
+	}
+
+	/// A sigil with no name after it is not an identifier — answering `"$"`
+	/// would hand every caller an empty name to look up.
+	#[test]
+	fn a_lone_sigil_is_not_an_identifier() {
+		let doc = document("StrCpy $ 0");
+		assert!(doc.identifier_at(Position::new(0, 8)).is_none());
 	}
 
 	// ── end_position ──
@@ -271,18 +347,24 @@ mod tests {
 	}
 
 	#[test]
-	fn word_at_reads_through_the_workspace() {
+	fn identifier_at_reads_through_the_workspace() {
 		let mut workspace = Workspace::new();
 		workspace.open(uri(URI), "StrCpy $0 $INSTDIR".to_string());
 
-		let (doc, word) = workspace.word_at(&uri(URI), Position::new(0, 12)).unwrap();
-		assert_eq!(word, "$INSTDIR");
+		let (doc, ident) = workspace
+			.identifier_at(&uri(URI), Position::new(0, 12))
+			.unwrap();
+		assert_eq!(ident.text, "$INSTDIR");
 		assert_eq!(doc.uri, uri(URI));
 	}
 
 	#[test]
-	fn word_at_unknown_document_is_none() {
+	fn identifier_at_unknown_document_is_none() {
 		let workspace = Workspace::new();
-		assert!(workspace.word_at(&uri(URI), Position::new(0, 0)).is_none());
+		assert!(
+			workspace
+				.identifier_at(&uri(URI), Position::new(0, 0))
+				.is_none()
+		);
 	}
 }
