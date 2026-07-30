@@ -3,7 +3,9 @@ mod compiler;
 mod context;
 mod diagnostics;
 mod nsis_data;
+mod position;
 mod symbols;
+mod workspace;
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -36,19 +38,9 @@ use serde::Deserialize;
 use cli::Cli;
 use compiler::PreprocessMode;
 use context::SyntaxContext;
+use position::{byte_to_utf16_offset, is_ident_char, line_at, utf16_to_byte_offset};
 use symbols::DocumentIndex;
-
-struct DocumentState {
-	text: String,
-	index: DocumentIndex,
-}
-
-impl DocumentState {
-	fn new(text: String) -> Self {
-		let index = symbols::index_document(&text);
-		Self { text, index }
-	}
-}
+use workspace::Workspace;
 
 #[derive(Debug, Default, Deserialize)]
 struct InitOptions {
@@ -226,7 +218,7 @@ fn main() {
 		);
 	}
 
-	let mut documents: HashMap<String, DocumentState> = HashMap::new();
+	let mut workspace = Workspace::new();
 
 	for msg in &connection.receiver {
 		match msg {
@@ -234,10 +226,10 @@ fn main() {
 				if connection.handle_shutdown(&req).unwrap_or(true) {
 					break;
 				}
-				handle_request(&connection, req, &documents, &state);
+				handle_request(&connection, req, &workspace, &state);
 			}
 			Message::Notification(not) => {
-				handle_notification(&connection, not, &mut documents, &mut state);
+				handle_notification(&connection, not, &mut workspace, &mut state);
 			}
 			Message::Response(_) => {}
 		}
@@ -249,16 +241,11 @@ fn main() {
 	io_threads.join().ok();
 }
 
-fn handle_request(
-	connection: &Connection,
-	req: Request,
-	documents: &HashMap<String, DocumentState>,
-	state: &LspState,
-) {
+fn handle_request(connection: &Connection, req: Request, workspace: &Workspace, state: &LspState) {
 	match req.method.as_str() {
 		Formatting::METHOD => {
 			if let Ok((id, params)) = req.extract::<DocumentFormattingParams>(Formatting::METHOD) {
-				match handle_formatting(documents, params, state) {
+				match handle_formatting(workspace, params, state) {
 					Ok(edits) => send_response(connection, id, edits),
 					Err((uri, msg)) => {
 						publish_format_error(connection, uri, &msg);
@@ -270,48 +257,48 @@ fn handle_request(
 		}
 		HoverRequest::METHOD => {
 			if let Ok((id, params)) = req.extract::<HoverParams>(HoverRequest::METHOD) {
-				send_response(connection, id, handle_hover(documents, params));
+				send_response(connection, id, handle_hover(workspace, params));
 			}
 		}
 		Completion::METHOD => {
 			if let Ok((id, params)) = req.extract::<CompletionParams>(Completion::METHOD) {
-				send_response(connection, id, handle_completion(documents, params));
+				send_response(connection, id, handle_completion(workspace, params));
 			}
 		}
 		GotoDefinition::METHOD => {
 			if let Ok((id, params)) = req.extract::<GotoDefinitionParams>(GotoDefinition::METHOD) {
-				send_response(connection, id, handle_goto_definition(documents, params));
+				send_response(connection, id, handle_goto_definition(workspace, params));
 			}
 		}
 		DocumentSymbolRequest::METHOD => {
 			if let Ok((id, params)) =
 				req.extract::<DocumentSymbolParams>(DocumentSymbolRequest::METHOD)
 			{
-				send_response(connection, id, handle_document_symbols(documents, params));
+				send_response(connection, id, handle_document_symbols(workspace, params));
 			}
 		}
 		References::METHOD => {
 			if let Ok((id, params)) = req.extract::<ReferenceParams>(References::METHOD) {
-				send_response(connection, id, handle_references(documents, params));
+				send_response(connection, id, handle_references(workspace, params));
 			}
 		}
 		PrepareRenameRequest::METHOD => {
 			if let Ok((id, params)) =
 				req.extract::<lsp_types::TextDocumentPositionParams>(PrepareRenameRequest::METHOD)
 			{
-				send_response(connection, id, handle_prepare_rename(documents, params));
+				send_response(connection, id, handle_prepare_rename(workspace, params));
 			}
 		}
 		Rename::METHOD => {
 			if let Ok((id, params)) = req.extract::<RenameParams>(Rename::METHOD) {
-				send_response(connection, id, handle_rename(documents, params));
+				send_response(connection, id, handle_rename(workspace, params));
 			}
 		}
 		SignatureHelpRequest::METHOD => {
 			if let Ok((id, params)) =
 				req.extract::<SignatureHelpParams>(SignatureHelpRequest::METHOD)
 			{
-				send_response(connection, id, handle_signature_help(documents, params));
+				send_response(connection, id, handle_signature_help(workspace, params));
 			}
 		}
 		CodeActionRequest::METHOD => {
@@ -326,7 +313,7 @@ fn handle_request(
 fn handle_notification(
 	connection: &Connection,
 	not: Notification,
-	documents: &mut HashMap<String, DocumentState>,
+	workspace: &mut Workspace,
 	state: &mut LspState,
 ) {
 	if let Some(params) = cast_notification::<DidChangeConfiguration>(not.clone()) {
@@ -335,20 +322,18 @@ fn handle_notification(
 		let uri = params.text_document.uri;
 		let text = params.text_document.text;
 		publish_diagnostics(connection, uri.clone(), &text);
-		documents.insert(uri.to_string(), DocumentState::new(text));
+		workspace.open(uri, text);
 	} else if let Some(params) = cast_notification::<DidChangeTextDocument>(not.clone())
 		&& let Some(change) = params.content_changes.into_iter().last()
 	{
 		let uri = params.text_document.uri;
 		publish_diagnostics(connection, uri.clone(), &change.text);
-		documents.insert(uri.to_string(), DocumentState::new(change.text));
+		workspace.open(uri, change.text);
 	} else if let Some(params) = cast_notification::<DidSaveTextDocument>(not)
 		&& state.diagnostics_on_save
+		&& let Some(doc) = workspace.document(&params.text_document.uri)
 	{
-		let uri = params.text_document.uri;
-		if let Some(doc) = documents.get(&uri.to_string()) {
-			run_compiler_diagnostics(connection, state, &uri, &doc.text);
-		}
+		run_compiler_diagnostics(connection, state, &doc.uri, &doc.text);
 	}
 }
 
@@ -450,12 +435,12 @@ fn run_compiler_diagnostics(
 // ── Formatting ──
 
 fn handle_formatting(
-	documents: &HashMap<String, DocumentState>,
+	workspace: &Workspace,
 	params: DocumentFormattingParams,
 	state: &LspState,
 ) -> Result<Vec<TextEdit>, (lsp_types::Uri, String)> {
 	let uri = params.text_document.uri;
-	let Some(doc) = documents.get(&uri.to_string()) else {
+	let Some(doc) = workspace.document(&uri) else {
 		return Ok(vec![]);
 	};
 	let text = &doc.text;
@@ -475,33 +460,17 @@ fn handle_formatting(
 
 	let formatted = formatter.format(text).map_err(|msg| (uri.clone(), msg))?;
 
-	let lines: Vec<&str> = text.lines().collect();
-	let last_line = lines.len().saturating_sub(1) as u32;
-	let last_col = lines.last().map_or(0, |l| byte_to_utf16_offset(l, l.len()));
-
-	let end = if text.ends_with('\n') || text.ends_with("\r\n") {
-		Position::new(last_line + 1, 0)
-	} else {
-		Position::new(last_line, last_col)
-	};
-
 	Ok(vec![TextEdit {
-		range: Range::new(Position::new(0, 0), end),
+		range: Range::new(Position::new(0, 0), doc.end_position()),
 		new_text: formatted,
 	}])
 }
 
 // ── Hover ──
 
-fn handle_hover(documents: &HashMap<String, DocumentState>, params: HoverParams) -> Option<Hover> {
-	let uri = params
-		.text_document_position_params
-		.text_document
-		.uri
-		.to_string();
-	let text = &documents.get(&uri)?.text;
-	let pos = params.text_document_position_params.position;
-	let word = word_at_position(text, pos.line, pos.character)?;
+fn handle_hover(workspace: &Workspace, params: HoverParams) -> Option<Hover> {
+	let at = params.text_document_position_params;
+	let (_, word) = workspace.word_at(&at.text_document.uri, at.position)?;
 
 	hover_for_word(&word).map(|value| Hover {
 		contents: HoverContents::Markup(MarkupContent {
@@ -603,12 +572,11 @@ static INTERPOLATED_ITEMS: LazyLock<Vec<CompletionItem>> = LazyLock::new(|| {
 });
 
 fn handle_completion(
-	documents: &HashMap<String, DocumentState>,
+	workspace: &Workspace,
 	params: CompletionParams,
 ) -> Option<CompletionResponse> {
-	let uri = params.text_document_position.text_document.uri.as_str();
 	let pos = params.text_document_position.position;
-	let doc = documents.get(uri)?;
+	let doc = workspace.document(&params.text_document_position.text_document.uri)?;
 
 	let mut items = match completion_context(&doc.text, pos) {
 		// Nothing is code inside a comment.
@@ -625,7 +593,7 @@ fn handle_completion(
 	// Replace the whole partial token, so `include` becomes `!include` and
 	// `INSTDIR` becomes `$INSTDIR` instead of keeping the client's word range,
 	// which would drop the sigil or double it up.
-	let line_str = doc.text.lines().nth(pos.line as usize).unwrap_or("");
+	let line_str = line_at(&doc.text, pos.line).unwrap_or("");
 	let range = completion_range(line_str, pos);
 	for item in &mut items {
 		item.text_edit = Some(CompletionTextEdit::Edit(TextEdit {
@@ -660,7 +628,7 @@ fn completion_range(line_str: &str, pos: Position) -> Range {
 }
 
 fn completion_context(text: &str, pos: Position) -> SyntaxContext {
-	let line_str = text.lines().nth(pos.line as usize).unwrap_or("");
+	let line_str = line_at(text, pos.line).unwrap_or("");
 	let col = utf16_to_byte_offset(line_str, pos.character);
 	context::context_at(text, pos.line, col)
 }
@@ -780,15 +748,13 @@ fn compute_diagnostics(text: &str) -> Vec<Diagnostic> {
 // ── Go to Definition ──
 
 fn handle_goto_definition(
-	documents: &HashMap<String, DocumentState>,
+	workspace: &Workspace,
 	params: GotoDefinitionParams,
 ) -> Option<GotoDefinitionResponse> {
-	let uri = &params.text_document_position_params.text_document.uri;
-	let doc = documents.get(&uri.to_string())?;
-	let pos = params.text_document_position_params.position;
-	let word = word_at_position(&doc.text, pos.line, pos.character)?;
+	let at = params.text_document_position_params;
+	let (doc, word) = workspace.word_at(&at.text_document.uri, at.position)?;
 
-	find_symbol_location(uri, &doc.index, &word)
+	find_symbol_location(&doc.uri, &doc.index, &word)
 }
 
 fn find_symbol_location(
@@ -818,10 +784,10 @@ fn find_symbol_location(
 // ── Document Symbols ──
 
 fn handle_document_symbols(
-	documents: &HashMap<String, DocumentState>,
+	workspace: &Workspace,
 	params: DocumentSymbolParams,
 ) -> Option<DocumentSymbolResponse> {
-	let doc = documents.get(&params.text_document.uri.to_string())?;
+	let doc = workspace.document(&params.text_document.uri)?;
 	let symbols = doc
 		.index
 		.symbols
@@ -866,14 +832,9 @@ fn symbol_def_to_document_symbol(sym: &symbols::SymbolDef) -> DocumentSymbol {
 
 // ── Find References ──
 
-fn handle_references(
-	documents: &HashMap<String, DocumentState>,
-	params: ReferenceParams,
-) -> Option<Vec<Location>> {
-	let uri = &params.text_document_position.text_document.uri;
-	let doc = documents.get(&uri.to_string())?;
-	let pos = params.text_document_position.position;
-	let word = word_at_position(&doc.text, pos.line, pos.character)?;
+fn handle_references(workspace: &Workspace, params: ReferenceParams) -> Option<Vec<Location>> {
+	let at = &params.text_document_position;
+	let (doc, word) = workspace.word_at(&at.text_document.uri, at.position)?;
 	let bare = word.trim_start_matches('$').trim_start_matches('!');
 	let kind = symbols::find_symbol_kind(&doc.index, &word)?;
 
@@ -881,16 +842,15 @@ fn handle_references(
 
 	if params.context.include_declaration
 		&& let Some(GotoDefinitionResponse::Scalar(loc)) =
-			find_symbol_location(uri, &doc.index, bare)
+			find_symbol_location(&doc.uri, &doc.index, bare)
 	{
 		locations.push(loc);
 	}
 
-	for (doc_uri, doc_state) in documents {
-		let parsed_uri: lsp_types::Uri = doc_uri.parse().ok()?;
-		for range in symbols::find_references(&doc_state.text, bare, kind) {
+	for other in workspace.documents() {
+		for range in symbols::find_references(&other.text, bare, kind) {
 			locations.push(Location {
-				uri: parsed_uri.clone(),
+				uri: other.uri.clone(),
 				range,
 			});
 		}
@@ -906,13 +866,11 @@ fn handle_references(
 // ── Rename ──
 
 fn handle_prepare_rename(
-	documents: &HashMap<String, DocumentState>,
+	workspace: &Workspace,
 	params: lsp_types::TextDocumentPositionParams,
 ) -> Option<PrepareRenameResponse> {
-	let uri = &params.text_document.uri;
-	let doc = documents.get(&uri.to_string())?;
 	let pos = params.position;
-	let word = word_at_position(&doc.text, pos.line, pos.character)?;
+	let (doc, word) = workspace.word_at(&params.text_document.uri, pos)?;
 	let bare = word.trim_start_matches('$').trim_start_matches('!');
 
 	if is_builtin(&word) {
@@ -921,7 +879,9 @@ fn handle_prepare_rename(
 
 	symbols::find_symbol_kind(&doc.index, &word)?;
 
-	let line_str = doc.text.lines().nth(pos.line as usize)?;
+	// The rename range covers the bare identifier, without the sigil `word_at`
+	// keeps — renaming `$myVar` rewrites `myVar` and leaves the `$`.
+	let line_str = line_at(&doc.text, pos.line)?;
 	let col = utf16_to_byte_offset(line_str, pos.character);
 	let bytes = line_str.as_bytes();
 	let mut start = col;
@@ -944,14 +904,9 @@ fn handle_prepare_rename(
 	})
 }
 
-fn handle_rename(
-	documents: &HashMap<String, DocumentState>,
-	params: RenameParams,
-) -> Option<WorkspaceEdit> {
-	let uri = &params.text_document_position.text_document.uri;
-	let doc = documents.get(&uri.to_string())?;
-	let pos = params.text_document_position.position;
-	let word = word_at_position(&doc.text, pos.line, pos.character)?;
+fn handle_rename(workspace: &Workspace, params: RenameParams) -> Option<WorkspaceEdit> {
+	let at = &params.text_document_position;
+	let (doc, word) = workspace.word_at(&at.text_document.uri, at.position)?;
 	let bare = word.trim_start_matches('$').trim_start_matches('!');
 	let kind = symbols::find_symbol_kind(&doc.index, &word)?;
 
@@ -964,10 +919,8 @@ fn handle_rename(
 	#[allow(clippy::mutable_key_type)]
 	let mut changes: HashMap<lsp_types::Uri, Vec<TextEdit>> = HashMap::new();
 
-	for (doc_uri, doc_state) in documents {
-		let parsed_uri: lsp_types::Uri = doc_uri.parse().ok()?;
-
-		let mut edits: Vec<TextEdit> = symbols::find_references(&doc_state.text, bare, kind)
+	for other in workspace.documents() {
+		let mut edits: Vec<TextEdit> = symbols::find_references(&other.text, bare, kind)
 			.into_iter()
 			.map(|range| TextEdit {
 				range,
@@ -975,7 +928,7 @@ fn handle_rename(
 			})
 			.collect();
 
-		for sym in &doc_state.index.symbols {
+		for sym in &other.index.symbols {
 			if sym.name.eq_ignore_ascii_case(bare) && sym.kind == kind {
 				edits.push(TextEdit {
 					range: sym.selection_range,
@@ -993,7 +946,7 @@ fn handle_rename(
 		}
 
 		if !edits.is_empty() {
-			changes.insert(parsed_uri, edits);
+			changes.insert(other.uri.clone(), edits);
 		}
 	}
 
@@ -1022,17 +975,13 @@ fn is_builtin(word: &str) -> bool {
 // ── Signature Help ──
 
 fn handle_signature_help(
-	documents: &HashMap<String, DocumentState>,
+	workspace: &Workspace,
 	params: SignatureHelpParams,
 ) -> Option<SignatureHelp> {
-	let uri = params
-		.text_document_position_params
-		.text_document
-		.uri
-		.to_string();
-	let text = &documents.get(&uri)?.text;
-	let pos = params.text_document_position_params.position;
-	let line_str = text.lines().nth(pos.line as usize)?;
+	let at = &params.text_document_position_params;
+	let text = &workspace.document(&at.text_document.uri)?.text;
+	let pos = at.position;
+	let line_str = line_at(text, pos.line)?;
 	let col = utf16_to_byte_offset(line_str, pos.character);
 
 	if is_in_comment(text, pos.line, col) {
@@ -1225,62 +1174,6 @@ fn is_in_comment(text: &str, line: u32, col: usize) -> bool {
 	context::context_at(text, line, col) == SyntaxContext::Comment
 }
 
-fn word_at_position(text: &str, line: u32, character: u32) -> Option<String> {
-	let line_str = text.lines().nth(line as usize)?;
-	let col = utf16_to_byte_offset(line_str, character);
-	if col > line_str.len() {
-		return None;
-	}
-
-	if is_in_comment(text, line, col) {
-		return None;
-	}
-
-	let bytes = line_str.as_bytes();
-	let mut start = col;
-	let mut end = col;
-
-	while start > 0 && is_ident_char(bytes[start - 1]) {
-		start -= 1;
-	}
-	while end < bytes.len() && is_ident_char(bytes[end]) {
-		end += 1;
-	}
-
-	if start > 0 && (bytes[start - 1] == b'!' || bytes[start - 1] == b'$') {
-		start -= 1;
-	}
-
-	if start == end {
-		return None;
-	}
-
-	Some(line_str[start..end].to_string())
-}
-
-fn is_ident_char(b: u8) -> bool {
-	b.is_ascii_alphanumeric() || b == b'_' || b == b'.'
-}
-
-fn utf16_to_byte_offset(line: &str, utf16_col: u32) -> usize {
-	let mut utf16_count = 0u32;
-	for (byte_idx, ch) in line.char_indices() {
-		if utf16_count >= utf16_col {
-			return byte_idx;
-		}
-		utf16_count += ch.len_utf16() as u32;
-	}
-	line.len()
-}
-
-fn byte_to_utf16_offset(line: &str, byte_offset: usize) -> u32 {
-	let mut count = 0u32;
-	for ch in line[..byte_offset].chars() {
-		count += ch.len_utf16() as u32;
-	}
-	count
-}
-
 fn send_response(connection: &Connection, id: RequestId, result: impl serde::Serialize) {
 	let resp = Response::new_ok(id, result);
 	connection.sender.send(Message::Response(resp)).ok();
@@ -1414,73 +1307,6 @@ mod tests {
 		assert_eq!(range_cols("Section ", 8), (8, 8));
 	}
 
-	// ── is_ident_char ──
-
-	#[test]
-	fn ident_char_alphanumeric() {
-		assert!(is_ident_char(b'a'));
-		assert!(is_ident_char(b'Z'));
-		assert!(is_ident_char(b'5'));
-	}
-
-	#[test]
-	fn ident_char_underscore_dot() {
-		assert!(is_ident_char(b'_'));
-		assert!(is_ident_char(b'.'));
-	}
-
-	#[test]
-	fn ident_char_rejects_special() {
-		assert!(!is_ident_char(b' '));
-		assert!(!is_ident_char(b'!'));
-		assert!(!is_ident_char(b'$'));
-	}
-
-	// ── utf16 <-> byte offset ──
-
-	#[test]
-	fn utf16_to_byte_ascii() {
-		assert_eq!(utf16_to_byte_offset("hello", 3), 3);
-	}
-
-	#[test]
-	fn byte_to_utf16_ascii() {
-		assert_eq!(byte_to_utf16_offset("hello", 3), 3);
-	}
-
-	#[test]
-	fn utf16_roundtrip_multibyte() {
-		let line = "aé€b";
-		let byte_off = utf16_to_byte_offset(line, 3);
-		let utf16_off = byte_to_utf16_offset(line, byte_off);
-		assert_eq!(utf16_off, 3);
-	}
-
-	// ── word_at_position ──
-
-	#[test]
-	fn word_at_position_simple() {
-		let text = "Section main\n  DetailPrint hello\nSectionEnd";
-		assert_eq!(word_at_position(text, 1, 4), Some("DetailPrint".into()));
-	}
-
-	#[test]
-	fn word_at_position_bang_prefix() {
-		let text = "!include file.nsh";
-		assert_eq!(word_at_position(text, 0, 2), Some("!include".into()));
-	}
-
-	#[test]
-	fn word_at_position_dollar_prefix() {
-		let text = "StrCpy $0 $INSTDIR";
-		assert_eq!(word_at_position(text, 0, 12), Some("$INSTDIR".into()));
-	}
-
-	#[test]
-	fn word_at_position_out_of_range() {
-		assert_eq!(word_at_position("hello", 5, 0), None);
-	}
-
 	// ── is_in_comment ──
 
 	#[test]
@@ -1508,15 +1334,34 @@ mod tests {
 		assert!(!is_in_comment(text, 2, 0));
 	}
 
-	#[test]
-	fn word_at_position_in_comment_returns_none() {
-		let text = "# DetailPrint hello";
-		assert_eq!(word_at_position(text, 0, 5), None);
+	// ── Test fixtures ──
+
+	const TEST_URI: &str = "file:///test.nsi";
+
+	fn uri(s: &str) -> lsp_types::Uri {
+		s.parse().unwrap()
+	}
+
+	fn workspace_with(documents: &[(&str, &str)]) -> Workspace {
+		let mut workspace = Workspace::new();
+		for (uri_str, text) in documents {
+			workspace.open(uri(uri_str), text.to_string());
+		}
+		workspace
+	}
+
+	fn position_params(
+		uri_str: &str,
+		line: u32,
+		character: u32,
+	) -> lsp_types::TextDocumentPositionParams {
+		lsp_types::TextDocumentPositionParams {
+			text_document: lsp_types::TextDocumentIdentifier { uri: uri(uri_str) },
+			position: Position { line, character },
+		}
 	}
 
 	// ── handle_completion ──
-
-	const TEST_URI: &str = "file:///test.nsi";
 
 	fn completion_labels(text: &str, line: u32, character: u32) -> Vec<String> {
 		completion_items(text, line, character)
@@ -1526,22 +1371,16 @@ mod tests {
 	}
 
 	fn completion_items(text: &str, line: u32, character: u32) -> Vec<CompletionItem> {
-		let mut documents = HashMap::new();
-		documents.insert(TEST_URI.to_string(), DocumentState::new(text.to_string()));
+		let workspace = workspace_with(&[(TEST_URI, text)]);
 
 		let params = CompletionParams {
-			text_document_position: lsp_types::TextDocumentPositionParams {
-				text_document: lsp_types::TextDocumentIdentifier {
-					uri: TEST_URI.parse().unwrap(),
-				},
-				position: Position { line, character },
-			},
+			text_document_position: position_params(TEST_URI, line, character),
 			work_done_progress_params: Default::default(),
 			partial_result_params: Default::default(),
 			context: None,
 		};
 
-		match handle_completion(&documents, params) {
+		match handle_completion(&workspace, params) {
 			Some(CompletionResponse::Array(items)) => items,
 			other => panic!("unexpected completion response: {other:?}"),
 		}
@@ -1632,22 +1471,102 @@ mod tests {
 
 	#[test]
 	fn completion_for_unknown_document_is_none() {
-		let documents: HashMap<String, DocumentState> = HashMap::new();
 		let params = CompletionParams {
-			text_document_position: lsp_types::TextDocumentPositionParams {
-				text_document: lsp_types::TextDocumentIdentifier {
-					uri: TEST_URI.parse().unwrap(),
-				},
-				position: Position {
-					line: 0,
-					character: 0,
-				},
-			},
+			text_document_position: position_params(TEST_URI, 0, 0),
 			work_done_progress_params: Default::default(),
 			partial_result_params: Default::default(),
 			context: None,
 		};
-		assert!(handle_completion(&documents, params).is_none());
+		assert!(handle_completion(&Workspace::new(), params).is_none());
+	}
+
+	// ── Requests that span the workspace ──
+
+	const A_URI: &str = "file:///a.nsi";
+	const B_URI: &str = "file:///b.nsi";
+
+	fn two_documents() -> Workspace {
+		workspace_with(&[
+			(A_URI, "!define APP_NAME \"Test\"\nDetailPrint ${APP_NAME}"),
+			(B_URI, "DetailPrint ${APP_NAME}\nDetailPrint ${APP_NAME}"),
+		])
+	}
+
+	fn rename_params(uri_str: &str, line: u32, character: u32, new_name: &str) -> RenameParams {
+		RenameParams {
+			text_document_position: position_params(uri_str, line, character),
+			new_name: new_name.to_string(),
+			work_done_progress_params: Default::default(),
+		}
+	}
+
+	fn reference_params(uri_str: &str, line: u32, character: u32) -> ReferenceParams {
+		ReferenceParams {
+			text_document_position: position_params(uri_str, line, character),
+			context: lsp_types::ReferenceContext {
+				include_declaration: true,
+			},
+			work_done_progress_params: Default::default(),
+			partial_result_params: Default::default(),
+		}
+	}
+
+	/// Every open document is edited, each under the `Uri` it was opened with.
+	#[test]
+	fn rename_edits_every_open_document() {
+		let edit = handle_rename(&two_documents(), rename_params(A_URI, 0, 10, "PRODUCT")).unwrap();
+		#[allow(clippy::mutable_key_type)]
+		let changes = edit.changes.unwrap();
+
+		assert_eq!(changes.len(), 2);
+		// One deref plus the `!define` itself.
+		assert_eq!(changes[&uri(A_URI)].len(), 2);
+		assert_eq!(changes[&uri(B_URI)].len(), 2);
+		assert!(changes.values().flatten().all(|e| e.new_text == "PRODUCT"));
+	}
+
+	#[test]
+	fn rename_from_the_document_without_the_definition() {
+		let edit = handle_rename(&two_documents(), rename_params(B_URI, 0, 15, "PRODUCT"));
+		// The kind is only known where the symbol is defined.
+		assert!(edit.is_none());
+	}
+
+	#[test]
+	fn references_span_every_open_document() {
+		let locations =
+			handle_references(&two_documents(), reference_params(A_URI, 0, 10)).unwrap();
+
+		let from_a = locations.iter().filter(|l| l.uri == uri(A_URI)).count();
+		let from_b = locations.iter().filter(|l| l.uri == uri(B_URI)).count();
+		assert_eq!(from_a, 2); // the declaration plus one deref
+		assert_eq!(from_b, 2);
+	}
+
+	#[test]
+	fn goto_definition_answers_with_the_stored_uri() {
+		let params = GotoDefinitionParams {
+			text_document_position_params: position_params(A_URI, 1, 15),
+			work_done_progress_params: Default::default(),
+			partial_result_params: Default::default(),
+		};
+
+		match handle_goto_definition(&two_documents(), params) {
+			Some(GotoDefinitionResponse::Scalar(loc)) => {
+				assert_eq!(loc.uri, uri(A_URI));
+				assert_eq!(loc.range.start.line, 0);
+			}
+			other => panic!("unexpected definition response: {other:?}"),
+		}
+	}
+
+	#[test]
+	fn requests_for_an_unopened_document_are_none() {
+		let workspace = two_documents();
+		assert!(handle_rename(&workspace, rename_params("file:///gone.nsi", 0, 10, "X")).is_none());
+		assert!(
+			handle_references(&workspace, reference_params("file:///gone.nsi", 0, 10)).is_none()
+		);
 	}
 
 	// ── compute_diagnostics ──

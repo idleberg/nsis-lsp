@@ -1,6 +1,7 @@
 use lsp_types::{Position, Range, SymbolKind};
 
 use crate::context::CodeScan;
+use crate::position::{byte_to_utf16_offset, is_ident_char};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NsisSymbolKind {
@@ -280,22 +281,14 @@ fn parse_section_name(after_keyword: &str) -> (String, Option<String>) {
 	(token, None)
 }
 
-fn byte_to_utf16(line: &str, byte_offset: usize) -> u32 {
-	let mut count = 0u32;
-	for ch in line[..byte_offset].chars() {
-		count += ch.len_utf16() as u32;
-	}
-	count
-}
-
 // The four helpers below take a line twice: `code` to locate a byte offset,
 // `line` to turn that offset into a UTF-16 column. Blanking a comment preserves
 // byte offsets but not UTF-16 ones, so the columns must come from the raw line.
 
 fn name_range(line_num: u32, line: &str, code: &str, name: &str) -> Range {
 	if let Some(byte_start) = code.find(name) {
-		let start = byte_to_utf16(line, byte_start);
-		let end = byte_to_utf16(line, byte_start + name.len());
+		let start = byte_to_utf16_offset(line, byte_start);
+		let end = byte_to_utf16_offset(line, byte_start + name.len());
 		Range::new(Position::new(line_num, start), Position::new(line_num, end))
 	} else {
 		make_line_range(line_num, line, code)
@@ -311,11 +304,11 @@ fn make_line_range(line_num: u32, line: &str, code: &str) -> Range {
 
 fn line_start_position(line_num: u32, line: &str, code: &str) -> Position {
 	let leading = code.len() - code.trim_start().len();
-	Position::new(line_num, byte_to_utf16(line, leading))
+	Position::new(line_num, byte_to_utf16_offset(line, leading))
 }
 
 fn line_end_position(line_num: u32, line: &str, code: &str) -> Position {
-	Position::new(line_num, byte_to_utf16(line, code.trim_end().len()))
+	Position::new(line_num, byte_to_utf16_offset(line, code.trim_end().len()))
 }
 
 pub fn find_symbol_kind(index: &DocumentIndex, word: &str) -> Option<NsisSymbolKind> {
@@ -391,8 +384,11 @@ impl LineRefs<'_> {
 	/// The range covering `len` bytes from `byte_offset`, in UTF-16 columns.
 	fn range_at(&self, byte_offset: usize, len: usize) -> Range {
 		Range::new(
-			Position::new(self.line_n, byte_to_utf16(self.line, byte_offset)),
-			Position::new(self.line_n, byte_to_utf16(self.line, byte_offset + len)),
+			Position::new(self.line_n, byte_to_utf16_offset(self.line, byte_offset)),
+			Position::new(
+				self.line_n,
+				byte_to_utf16_offset(self.line, byte_offset + len),
+			),
 		)
 	}
 }
@@ -453,7 +449,7 @@ impl LineRefs<'_> {
 				continue;
 			}
 			// Check word boundary after
-			if after < bytes.len() && is_ident_byte(bytes[after]) {
+			if after < bytes.len() && is_ident_char(bytes[after]) {
 				search_from = after;
 				continue;
 			}
@@ -494,10 +490,6 @@ impl LineRefs<'_> {
 			}
 		}
 	}
-}
-
-fn is_ident_byte(b: u8) -> bool {
-	b.is_ascii_alphanumeric() || b == b'_' || b == b'.'
 }
 
 #[cfg(test)]
