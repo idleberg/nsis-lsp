@@ -25,11 +25,11 @@ A synchronous, single-threaded LSP server over stdio built on `lsp-server`/`lsp-
 
 Three pieces of state exist, all owned by `main`:
 
-- `LspState` — settings, built from `initializationOptions` at startup and rebuilt wholesale on `workspace/didChangeConfiguration`. `parse_settings` accepts the options bare or under an `nsis` section, and distinguishes `Unavailable` (client sent `null`) from `Unparseable` (logged, settings kept).
+- `LspState` ([settings.rs](src/settings.rs)) — settings, built from `initializationOptions` at startup and rebuilt wholesale on `workspace/didChangeConfiguration`. `InitOptions` mirrors the JSON, `LspState` is the resolved form the handlers read. `parse_settings` accepts the options bare or under an `nsis` section, and distinguishes `Unavailable` (client sent `null`) from `Unparseable` (logged, settings kept).
 - `Workspace` ([workspace.rs](src/workspace.rs)) — the open documents. Each `Document` re-derives its `DocumentIndex` and deprecation diagnostics on every open/change; document sync is FULL, so a change replaces the text.
 - `Client` ([client.rs](src/client.rs)) — the trait for everything the server says outward. `Stdio` writes to the real connection; `Recorder` captures messages in memory so `handle_request`/`handle_notification` can be driven directly in tests and the resulting responses, diagnostics and log lines asserted on.
 
-Request and notification dispatch are two flat `match`/`if let` chains in `main.rs`; each `handle_*` function is a pure-ish function of `(&Workspace, params, &LspState)`. Adding a feature means advertising it in `capabilities`, adding an arm, and writing the handler beside its siblings.
+Request and notification dispatch are two flat `match`/`if let` chains in `main.rs`, and nothing else lives there: every `handle_*` is a pure-ish function of `(&Workspace, params, &LspState)` in its own module under [handlers/](src/handlers/) — `completion`, `hover`, `signature`, `symbols` (the document outline), `navigation` (go-to-definition and find-references), `rename`, `formatting`, `code_action`. Adding a feature means advertising it in `capabilities`, adding an arm, and writing the handler in the module for its feature. Shared test fixtures for the handlers live in [testing.rs](src/testing.rs).
 
 ### Knowledge about NSIS
 
