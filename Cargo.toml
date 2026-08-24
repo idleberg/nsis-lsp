@@ -6,6 +6,7 @@ authors = ["Jan T. Sott"]
 repository = "https://github.com/idleberg/nsis-lsp"
 license = "MIT OR Apache-2.0"
 edition = "2024"
+include = ["src", "README.md"]
 
 [[bin]]
 name = "nsis-lsp"
