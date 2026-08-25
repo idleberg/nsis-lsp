@@ -33,6 +33,7 @@ pub fn handle_formatting(
 		end_of_line: state.end_of_line.clone(),
 		print_width: state.print_width,
 		single_quote: state.single_quote,
+		comment_style: state.comment_style,
 	};
 
 	let Ok(formatter) = Formatter::new(options) else {
@@ -79,7 +80,44 @@ fn parse_error_position(msg: &str) -> Option<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
+	use lsp_types::{DocumentFormattingParams, FormattingOptions, TextDocumentIdentifier};
+
 	use super::*;
+	use crate::testing::{TEST_URI, quiet_state, uri, workspace_with};
+
+	fn formatting_params() -> DocumentFormattingParams {
+		DocumentFormattingParams {
+			text_document: TextDocumentIdentifier { uri: uri(TEST_URI) },
+			options: FormattingOptions {
+				tab_size: 2,
+				insert_spaces: false,
+				..Default::default()
+			},
+			work_done_progress_params: Default::default(),
+		}
+	}
+
+	#[test]
+	fn formatting_keeps_comment_markers_by_default() {
+		let workspace = workspace_with(&[(TEST_URI, "; semi\n# hash\n")]);
+
+		let edits = handle_formatting(&workspace, formatting_params(), &quiet_state()).unwrap();
+
+		assert!(edits[0].new_text.contains("; semi"));
+		assert!(edits[0].new_text.contains("# hash"));
+	}
+
+	#[test]
+	fn formatting_rewrites_comment_markers_when_a_style_is_set() {
+		let workspace = workspace_with(&[(TEST_URI, "; semi\n# hash\n")]);
+		let mut state = quiet_state();
+		state.comment_style = Some(ardent::CommentStyle::Hash);
+
+		let edits = handle_formatting(&workspace, formatting_params(), &state).unwrap();
+
+		assert!(edits[0].new_text.contains("# semi"));
+		assert!(!edits[0].new_text.contains("; semi"));
+	}
 
 	#[test]
 	fn parse_error_position_valid() {

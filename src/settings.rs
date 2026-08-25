@@ -9,7 +9,7 @@
 //! `workspace/didChangeConfiguration` later, and both end at
 //! [`LspState::from_options`].
 
-use ardent::EndOfLine;
+use ardent::{CommentStyle, EndOfLine};
 use lsp_types::MessageType;
 use serde::Deserialize;
 
@@ -36,6 +36,8 @@ pub struct FormatterInitOptions {
 	pub trim_empty_lines: bool,
 	#[serde(default)]
 	pub single_quote: bool,
+	#[serde(default)]
+	pub comment_style: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,6 +80,7 @@ impl Default for FormatterInitOptions {
 			print_width: 0,
 			trim_empty_lines: true,
 			single_quote: false,
+			comment_style: None,
 		}
 	}
 }
@@ -90,6 +93,16 @@ pub fn parse_end_of_line(value: Option<&str>) -> Option<EndOfLine> {
 	}
 }
 
+// Anything else, an absent setting included, leaves every comment with the marker
+// the author wrote it with.
+pub fn parse_comment_style(value: Option<&str>) -> Option<CommentStyle> {
+	match value {
+		Some("hash") => Some(CommentStyle::Hash),
+		Some("semi") => Some(CommentStyle::Semi),
+		_ => None,
+	}
+}
+
 pub struct LspState {
 	pub makensis_path: Option<String>,
 	pub preprocess_mode: PreprocessMode,
@@ -98,6 +111,7 @@ pub struct LspState {
 	pub print_width: usize,
 	pub trim_empty_lines: bool,
 	pub single_quote: bool,
+	pub comment_style: Option<CommentStyle>,
 }
 
 impl LspState {
@@ -112,6 +126,7 @@ impl LspState {
 			print_width: options.formatter.print_width,
 			trim_empty_lines: options.formatter.trim_empty_lines,
 			single_quote: options.formatter.single_quote,
+			comment_style: parse_comment_style(options.formatter.comment_style.as_deref()),
 		}
 	}
 }
@@ -277,6 +292,27 @@ mod tests {
 		));
 		assert!(parse_end_of_line(Some("auto")).is_none());
 		assert!(parse_end_of_line(None).is_none());
+	}
+
+	#[test]
+	fn state_parses_comment_style() {
+		assert!(matches!(
+			parse_comment_style(Some("hash")),
+			Some(CommentStyle::Hash)
+		));
+		assert!(matches!(
+			parse_comment_style(Some("semi")),
+			Some(CommentStyle::Semi)
+		));
+		assert!(parse_comment_style(Some("preserve")).is_none());
+		assert!(parse_comment_style(None).is_none());
+	}
+
+	#[test]
+	fn state_leaves_comment_markers_alone_by_default() {
+		let state = LspState::from_options(replaced(json!({})));
+
+		assert!(state.comment_style.is_none());
 	}
 
 	#[test]
