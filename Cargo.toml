@@ -13,7 +13,7 @@ name = "nsis-lsp"
 path = "src/main.rs"
 
 [dependencies]
-ardent = "0.13.0"
+ardent = "0.14.0"
 clap = { version = "4.6.4", features = ["derive"] }
 lsp-server = "0.10"
 lsp-types = "0.97"
