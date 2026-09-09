@@ -76,9 +76,10 @@ and `insertSpaces` values the editor sends with each formatting request.
 
 The following Editor extensions integrate `nsis-lsp`:
 
-- [nova-nsis](https://github.com/idleberg/nova-nsis)
+- [vscode-nsis](https://github.com/idleberg/vscode-nsis)
 - [sublime-lsp-nsis](https://github.com/idleberg/sublime-lsp-nsis)
 - [zed-nsis](https://github.com/idleberg/zed-nsis-extension)
+- [nova-nsis](https://github.com/idleberg/nova-nsis)
 
 ## License
 
