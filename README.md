@@ -79,6 +79,7 @@ The following Editor extensions integrate `nsis-lsp`:
 - [vscode-nsis](https://github.com/idleberg/vscode-nsis)
 - [sublime-lsp-nsis](https://github.com/idleberg/sublime-lsp-nsis)
 - [zed-nsis](https://github.com/idleberg/zed-nsis-extension)
+- [atom-language-nsis](https://github.com/idleberg/atom-language-nsis)
 - [nova-nsis](https://github.com/idleberg/nova-nsis)
 
 ## License
